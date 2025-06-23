@@ -37,6 +37,8 @@
 #include <torch/csrc/utils/pybind.h>
 #include <torch/python.h>
 
+namespace py = pybind11;
+
 using namespace rocshmem;
 // TODO: add pyrocshmem pybinding
 
@@ -94,6 +96,10 @@ private:
 // TODO: found rocshmem init state related API or returns.
 
 #define ENABLE_ROCSHMEM 1
+
+void rocshmem_init_try(){
+  printf("\npyrocshmem.cc  - Hello from rocshmem_init_try\n");
+}
 
 #if ENABLE_ROCSHMEM
 inline torch::Tensor create_tensor(const std::vector<int64_t> &shape,
@@ -192,6 +198,7 @@ static void all_gather_helper(c10d::ProcessGroup *pg, const void *src,
   // dst_tensor = dst_tensor_gpu.to(option_cpu);
   dst_tensor.copy_(dst_tensor_gpu.to(option_cpu));
 }
+
 
 static std::vector<torch::Tensor>
 hipipc_create_tensor_list(c10d::ProcessGroup *group,
@@ -344,8 +351,25 @@ rocshmem_create_tensor_list(const std::vector<int64_t> &shape,
 #endif
 
 PYBIND11_MODULE(_pyrocshmem, m) {
-#if ENABLE_ROCSHMEM
+//#if ENABLE_ROCSHMEM
+  m.def("rocshmem_init_try",[]() {printf("\n**Hello from init try\n");});
+  m.def("rocshmem_my_pe",[]() -> int {return rocshmem_my_pe();});
+  m.def("rocshmem_n_pes",[]() -> int {return rocshmem_n_pes();});
+  m.def("rocshmem_team_my_pe", [](uintptr_t team) -> int {
+    // check_rocshmem_init();
+    return rocshmem_team_my_pe((rocshmem_team_t)team);
+  });
+  m.def("rocshmem_team_n_pes", [](uintptr_t team) -> int {
+    // check_nvshmem_init();
+    return rocshmem_team_n_pes((rocshmem_team_t)team);
+  });
   m.def("rocshmem_init", []() { rocshmem_init(); });
+  m.def("rocshmem_hsaco_init", [](int64_t module, uintptr_t ctx) {
+    return rocshmem_hsaco_init((hipModule_t &) module, (void *) ctx );
+  });
+  m.def("rocshmem_get_host_internal_ctx",[]() -> int64_t {
+    return (int64_t) get_host_internal_ctx();
+  });
   m.def("rocshmem_finalize", []() { rocshmem_finalize(); });
   m.def("rocshmem_malloc", [](size_t size) {
     void *ptr = rocshmem_malloc(size);
@@ -354,7 +378,11 @@ PYBIND11_MODULE(_pyrocshmem, m) {
     }
     return (intptr_t)ptr;
   });
-#endif
+  m.def("rocshmem_free", [](intptr_t ptr) {rocshmem_free((void*) ptr);});
+  // m.def("rocshmem_ptr", [](intptr_t ptr, int pe) -> intptr_t {
+  //   return (intptr_t) rocshmem_ptr((void*) ptr, pe);
+  // });
+//#endif
   // TODO: find the related rocshmem Host side API.
   /*m.def("rocshmemx_get_uniqueid", []() {
     rocshmemx_uniqueid_t id;
@@ -377,15 +405,15 @@ PYBIND11_MODULE(_pyrocshmem, m) {
     CHECK_ROCSHMEMX(nvshmemx_init_attr(ROCSHMEMX_INIT_WITH_UNIQUEID,
   &init_attr));
   });*/
-#if ENABLE_ROCSHMEM
+//#if ENABLE_ROCSHMEM
   m.def("rocshmem_create_tensor",
         [](const std::vector<int64_t> shape, py::object dtype) {
           auto cast_dtype = torch::python::detail::py_object_to_dtype(dtype);
           return create_tensor(shape, cast_dtype);
         });
   m.def("rocshmem_barrier_all", []() { rocshmem_barrier_all(); });
-#endif
-#if ENABLE_ROCSHMEM
+//#endif
+//#if ENABLE_ROCSHMEM
   m.def(
       "rocshmem_create_tensor_list_intra_node",
       [](const std::vector<int64_t> &shape, py::object dtype) {
@@ -393,7 +421,7 @@ PYBIND11_MODULE(_pyrocshmem, m) {
             shape, torch::python::detail::py_object_to_dtype(std::move(dtype)));
       },
       py::arg("shape"), py::arg("dtype"));
-#endif
+//#endif
   m.def(
       "rocshmem_get_tensors_from_ipchandle",
       [](int64_t rank, int64_t world_size,

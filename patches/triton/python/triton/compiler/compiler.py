@@ -264,6 +264,7 @@ def compile(src, target=None, options=None):
     # run compilation pipeline  and populate metadata
     stages = dict()
     backend.add_stages(stages, options)
+
     first_stage = list(stages.keys()).index(src.ext)
     # when the source is an IR file, don't apply the passes related to this stage. This makes it easier to write IR level tests.
     if ir_source:
@@ -283,6 +284,7 @@ def compile(src, target=None, options=None):
     except Exception as e:
         filter_traceback(e)
         raise
+
     use_ir_loc = os.environ.get("USE_IR_LOC", None)
     for ext, compile_ir in list(stages.items())[first_stage:]:
         next_module = compile_ir(module, metadata)
@@ -358,7 +360,6 @@ class AsmDict(dict):
 
 
 class CompiledKernel:
-
     # Hooks for external tools to monitor the execution of triton kernels
     # TODO: move out of this namespace since it's a runtime thing
     launch_enter_hook = None
@@ -419,7 +420,9 @@ class CompiledKernel:
                 pynvshmem.nvshmemx_cumodule_init(self.module)
         elif hasattr(self.metadata, 'use_rocshmem'):
             if self.metadata.use_rocshmem:
-                pass
+                #pass
+                from triton_dist import pyrocshmem
+                # pyrocshmem.rocshmem_hsaco_init(self.module)
                 ## TODO: add pyrocshmem init
                 # import pyrocshmem
         else:

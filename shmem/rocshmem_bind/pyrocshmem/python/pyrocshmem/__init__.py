@@ -23,11 +23,14 @@
 #
 ################################################################################
 import sys
-
+from typing import Sequence
 import torch
 import torch.distributed
 
+from hip import hip
+
 try:
+    from _pyrocshmem import rocshmem_malloc, rocshmem_my_pe, rocshmem_free
     from _pyrocshmem import *  # noqa: F403
 except Exception as e:
     print(
@@ -36,6 +39,77 @@ except Exception as e:
         file=sys.stderr,
     )
     raise e
+
+class SymmHeap:
+    def __init__(self, ptr, nbytes, dtype: torch.dtype,own_data: bool = True):
+        self.ptr = ptr
+        self.nbytes = nbytes
+        self.dtype = dtype
+        self._device = torch.cuda.current_device()
+        self.own_data = own_data
+        self.__cuda_array_interface__ = {
+            "data": (self.ptr, False),
+            "shape": tuple((self.nbytes, )),
+            "typestr": "<i1",  # uint8 data type
+            "strides": None,  # Contiguous memory
+            "version": 3,
+        }
+        self.hip = hip
+        self.rocshmem_free = rocshmem_free
+     
+    # def __del__(self):
+    #     if self.own_data:
+
+    #         err, device = self.hip.hipGetDevice()
+    #         assert err == self.hip.hipError_t.hipSuccess, f"hipError: {err}"
+    #         if device != self._device:
+    #             err, = self.hip.hipSetDevice(self._device)
+    #             assert err == self.hip.hipError_t.hipSuccess, f"hipError: {err}"
+    #         # sync
+    #         err, = self.hip.hipDeviceSynchronize()
+    #         assert err == self.hip.hipError_t.hipSuccess, f"hipError: {err}"
+
+    #         self.rocshmem_free(self.ptr)
+
+    #         # sync
+    #         err, = self.hip.hipDeviceSynchronize()
+    #         assert err == self.hip.hipError_t.hipSuccess
+    #         # set device back
+    #         if device != self._device:
+    #             err, = self.hip.hipSetDevice(device)
+    #             assert err == self.hip.hipError_t.hipSuccess, f"hipError: {err}"
+
+    #         self.own_data = False
+
+def symm_heap_tensor(tensor: torch.Tensor, peer: int) -> torch.Tensor:
+    print("--- symm_heap_tensor ---")
+
+    if peer == rocshmem_my_pe():
+        return tensor
+    buffer = SymmHeap(ptr=tensor.data_ptr(),nbytes=tensor.nbytes, dtype=tensor.dtype)
+
+    return torch.as_tensor(buffer, device="cuda").view(tensor.dtype).view(tensor.shape)
+
+def rocshmmem_create_tensor(shape: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
+    print("--- rocshmmem_create_tensor ---")
+    nbytes = torch.Size(shape).numel() * dtype.itemsize
+    print(f"my_pe: {rocshmem_my_pe()} nbytes: {nbytes}")
+    torch.cuda.synchronize()
+    ptr=rocshmem_malloc(nbytes)
+    buffer = SymmHeap(ptr, nbytes=nbytes, dtype=dtype)
+    t = torch.as_tensor(buffer,device="cuda").view(dtype).view(shape)
+
+    return t
+ROCSHMEM_TEAM_WORLD = 2
+def rocshmem_create_tensor_list_intra_node(shape: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
+    print("--- rocshmem_create_tensor_list_intra_node ---")
+
+    t = rocshmmem_create_tensor(shape, dtype)
+    # local_rank = rocshmem_team_my_pe(ROCSHMEM_TEAM_WORLD)
+    rank = rocshmem_my_pe()
+    # rank_offset = rank - local_rank
+    #print(f"team_n_pes: {rocshmem_team_n_pes(ROCSHMEM_TEAM_WORLD)} local_rank: {local_rank} rank: {rank} rank_offset: {rank_offset}")
+    return [symm_heap_tensor(t, i + rank) for i in range(2)]
 
 
 def broadcast_cpu(tensor: torch.Tensor, src: int, group: torch.distributed.ProcessGroup):

@@ -22,7 +22,8 @@
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 ################################################################################
-from . import libdevice
+from . import libdevice, librocshmem_device
 # TODO: import librocshmem_device
 
-__all__ = ["libdevice"]
+__all__ = ["libdevice", "librocshmem_device"]
+

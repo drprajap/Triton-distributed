@@ -445,7 +445,8 @@ def build_shmem():
             if torch.version.hip is None:
                 build_nvshmem(torch.cuda.get_device_capability())
             else:
-                build_rocshmem(torch.cuda.get_device_capability())  # (9, 4)
+                #build_rocshmem(torch.cuda.get_device_capability())  # (9, 4)
+                pass
     except Exception as e:
         print("Cannot import torch.")
         raise e
@@ -770,12 +771,26 @@ def add_link_to_pynvshmem():
     update_symlink(triton_dist_root / "python" / "triton_dist" / "_C" / "nvshmem",
                    triton_dist_root / "3rdparty" / "nvshmem" / "build" / "install")
 
+def add_link_to_pyrocshmem():
+    print("** add_link_to_pyrocshmem** ")
+    triton_dist_root = Path(os.path.abspath(__file__)).parent.parent.absolute()
+    update_symlink(triton_dist_root / "python" / "triton_dist" / "pyrocshmem",
+                   triton_dist_root / "shmem" / "rocshmem_bind" / "pyrocshmem" / "python" / "pyrocshmem")
+    # update pyi
+    update_symlink(triton_dist_root / "python" / "triton_dist" / "_C" / "_pyrocshmem",
+                   triton_dist_root / "shmem" / "rocshmem_bind" / "pyrocshmem" / "python" / "_pyrocshmem")
+    # link nvshmem lib
+    update_symlink(triton_dist_root / "python" / "triton_dist" / "_C" / "pyrocshmem",
+                   triton_dist_root / "3rdparty" / "pyrocshmem" / "build" / "install")
+
+
 
 def add_links():
     add_link_to_backends()
     if check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
         add_link_to_proton()
     if check_env_flag("TRITON_BUILD_DISTRIBUTED", "ON"):  # Default ON
+        print("** TRITON_BUILD_DISTRIBUTED **")
         add_link_to_distributed()
         try:
             import torch
@@ -784,7 +799,7 @@ def add_links():
                 if torch.version.hip is None:
                     add_link_to_pynvshmem()
                 else:
-                    pass
+                   add_link_to_pyrocshmem()
         except Exception:
             print("Cannot import torch.")
             pass
@@ -880,7 +895,8 @@ def get_packages():
                     packages += ["triton_dist/pynvshmem"]
                     packages += ["triton_dist/_C/_pynvshmem"]
                 else:
-                    pass
+                    packages += ["triton_dist/pyrocshmem"]
+                    packages += ["triton_dist/_C/_pyrocshmem"]
         except Exception:
             print("Cannot import torch.")
             pass
