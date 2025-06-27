@@ -27,19 +27,6 @@ import triton.language as tl
 from triton_dist.core import extern_call
 import sys
 
-# TODO: add rocshmem
-
-@core.extern
-def my_pe(_builder=None):
-    return extern_call(
-        "librocshmem_device",
-        "",
-        [],
-        {(): ("rocshmem_my_pe_kernel",(tl.int32))},
-        is_pure=False,
-        _builder=_builder,
-    )
-
 @core.extern
 def set_rocshmem_ctx(ctx, _builder=None):
     return extern_call(
@@ -56,26 +43,17 @@ def set_rocshmem_ctx(ctx, _builder=None):
     )
 
 @core.extern
-def get_rocshmem_ctx(dest, pe, _builder=None):
+def my_pe(_builder=None):
     return extern_call(
         "librocshmem_device",
         "",
-        [
-            tl.cast(dest, tl.pointer_type(tl.void), _builder=_builder),
-            tl.cast(pe, tl.int32, _builder=_builder),
-        ],
-        {(tl.pointer_type(tl.void), tl.int32): (
-             "rocshmem_get_rocshmem_ctx",()
-         ),},
+        [],
+        {(): ("rocshmem_my_pe_kernel",(tl.int32))},
         is_pure=False,
         _builder=_builder,
     )
-# 
+
 @core.extern
-# def n_pes(_builder=None):
-#     return core.extern_elementwise("librocshmem_device", "", [], {
-#         (): ("rocshmem_n_pes", core.dtype("int32")),
-#     }, is_pure=True, _builder=_builder)
 def n_pes(_builder=None):
     return extern_call(
         "librocshmem_device",
@@ -88,13 +66,6 @@ def n_pes(_builder=None):
     )
 
 @core.extern
-# def int_p(dest, value, pe, _builder=None):
-#     # force have a return value, even not used.
-#     return core.extern_elementwise(
-#         "librocshmem_device", "", [dest, value, pe], {
-#             (core.pointer_type(core.dtype("int32")), core.dtype("int32"), core.dtype("int32")):
-#             ("rocshmem_int_p", core.dtype("int32")),
-#         }, is_pure=False, _builder=_builder, check_args=False)
 def int_p(dest, value, pe, _builder=None):
     return extern_call(
         "librocshmem_device",

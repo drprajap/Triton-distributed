@@ -364,11 +364,8 @@ PYBIND11_MODULE(_pyrocshmem, m) {
     return rocshmem_team_n_pes((rocshmem_team_t)team);
   });
   m.def("rocshmem_init", []() { rocshmem_init(); });
-  m.def("rocshmem_hsaco_init", [](int64_t module, uintptr_t ctx) {
-    return rocshmem_hsaco_init((hipModule_t &) module, (void *) ctx );
-  });
-  m.def("rocshmem_get_host_internal_ctx",[]() -> int64_t {
-    return (int64_t) get_host_internal_ctx();
+  m.def("rocshmem_get_device_ctx",[]() -> int64_t {
+    return (int64_t) rocshmem_get_device_ctx();
   });
   m.def("rocshmem_finalize", []() { rocshmem_finalize(); });
   m.def("rocshmem_malloc", [](size_t size) {

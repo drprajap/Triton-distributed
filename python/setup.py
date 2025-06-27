@@ -772,7 +772,6 @@ def add_link_to_pynvshmem():
                    triton_dist_root / "3rdparty" / "nvshmem" / "build" / "install")
 
 def add_link_to_pyrocshmem():
-    print("** add_link_to_pyrocshmem** ")
     triton_dist_root = Path(os.path.abspath(__file__)).parent.parent.absolute()
     update_symlink(triton_dist_root / "python" / "triton_dist" / "pyrocshmem",
                    triton_dist_root / "shmem" / "rocshmem_bind" / "pyrocshmem" / "python" / "pyrocshmem")
@@ -790,7 +789,6 @@ def add_links():
     if check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
         add_link_to_proton()
     if check_env_flag("TRITON_BUILD_DISTRIBUTED", "ON"):  # Default ON
-        print("** TRITON_BUILD_DISTRIBUTED **")
         add_link_to_distributed()
         try:
             import torch

@@ -52,19 +52,24 @@ def test_rocshmem_basic():
     def _rocshmem_basic(comm_buf, ctx):
         
         libshmem_device.set_rocshmem_ctx(ctx)
+        # dl_my_pe = dl.rank()
+        # dl_num_ranks = dl.num_ranks()
 
-        tl.store(comm_buf, dl.rank())
+        my_pe = libshmem_device.my_pe()
+        num_pes = libshmem_device.n_pes()
+
+        # tl.store(comm_buf, dl_my_pe)
+        # comm_buf+=1
+        # tl.store(comm_buf, dl_num_ranks)
+        # comm_buf+=1
+        tl.store(comm_buf, my_pe)
         comm_buf+=1
-        tl.store(comm_buf, dl.num_ranks())
+        tl.store(comm_buf, num_pes)
 
 
     @triton.jit
     def _rocshmem_get_pe(comm_buf,ctx):
         libshmem_device.set_rocshmem_ctx(ctx)
-
-        tl.store(comm_buf, libshmem_device.my_pe())
-        comm_buf+=1
-        tl.store(comm_buf, libshmem_device.n_pes())
 
 
     print("rocshmem basic start!")
@@ -74,7 +79,7 @@ def test_rocshmem_basic():
     print('mype: {} -- num_pes: {}'.format(my_pe, npes))
     pyrocshmem.rocshmem_init()
 
-    ctx = pyrocshmem.rocshmem_get_host_internal_ctx()
+    ctx = pyrocshmem.rocshmem_get_device_ctx()
     # print("ctx - {}".format(hex(ctx)))
 
     # M = 16
@@ -90,14 +95,35 @@ def test_rocshmem_basic():
     _rocshmem_basic[(1, )](comm_buf, ctx)
     print(f"_rocshmem_basic [dl.rank , dl.num_ranks] from pe#{my_pe}: {comm_buf}")
     
-    pyrocshmem.rocshmem_barrier_all()
+    # pyrocshmem.rocshmem_barrier_all()
     
-    comm_buf.zero_()
+    # comm_buf.zero_()
 
-    _rocshmem_get_pe[(1, )](comm_buf, ctx)
-    print(f"comm_buf from pe#{my_pe}: {comm_buf}")
+    # _rocshmem_get_pe[(1, )](comm_buf, ctx)
+    # print(f"comm_buf from pe#{my_pe}: {comm_buf}")
+
+    try:
+        torch.testing.assert_close(
+            comm_buf,
+            torch.tensor([my_pe, npes], dtype=torch.int32,
+                         device="cuda")), comm_buf
+    except Exception as e:
+        print(" rocnvshmem basic failed")
+        raise (e)
+    else:
+        print("✅ rocshmem basic pass")
 
     pyrocshmem.rocshmem_finalize()
+
+
+def test_rocshmem_getmem():
+    @triton.jit
+    def _rocshmem_getmem(ctx):
+        libshmem_device.set_rocshmem_ctx(ctx)
+
+        my_pe = libshmem_device.my_pe()
+        num_pes = libshmem_device.n_pes()
+        
 
 
 if __name__ == "__main__":

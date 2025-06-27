@@ -422,9 +422,6 @@ class CompiledKernel:
             if self.metadata.use_rocshmem:
                 #pass
                 from triton_dist import pyrocshmem
-                # pyrocshmem.rocshmem_hsaco_init(self.module)
-                ## TODO: add pyrocshmem init
-                # import pyrocshmem
         else:
             print("Warning: No nvshmem/rocshmem imported.")
 

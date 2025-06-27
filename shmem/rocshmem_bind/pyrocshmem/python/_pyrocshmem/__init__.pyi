@@ -43,10 +43,7 @@ class SymmHeap:
 def rocshmemx_cumodule_init(module: np.intp) -> None:
     ...
 
-def rocshmem_hsaco_init(module: np.int64, ctx: np.intp) -> None:
-    ...
-
-def get_host_internal_ctx() -> np.intp:
+def rocshmem_get_device_ctx() -> np.intp:
     ...
 
 def rocshmemx_cumodule_finalize(module: np.intp) -> None:

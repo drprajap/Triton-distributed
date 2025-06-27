@@ -40,21 +40,6 @@ __device__ void __attribute__((visibility("default"))) rocshmem_set_rocshmem_ctx
   ROCSHMEM_CTX_DEFAULT.ctx_opaque = ctx;
 }
 
-
-__device__ void __attribute__((visibility("default"))) rocshmem_get_rocshmem_ctx(
-  int *dest, int pe) {
-  int64_t ctx_addr = reinterpret_cast<int64_t>(get_rshmem_ctx());
-
-  printf("\n rocshmem_get_rocshmem_ctx: %p",ctx_addr);
-  int32_t address[2];
-
-  address[0] = static_cast<int32_t>(ctx_addr & 0xFFFFFFFF);
-  address[1] =  static_cast<int32_t>((ctx_addr >> 32) & 0xFFFFFFFF);
-
-  rocshmem_int_p(dest, address[0], pe);
-  rocshmem_int_p((dest+1), address[1], pe);
-}
-
 __device__ int __attribute__((used)) rocshmem_n_pes_kernel() {
   return rocshmem_n_pes();
 }
