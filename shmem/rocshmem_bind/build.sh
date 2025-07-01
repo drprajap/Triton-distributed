@@ -62,13 +62,13 @@ apt_install_deps
 
 bash -x ${PROJECT_ROOT}/build_rocshmem.sh
 
-# bash -x ${PROJECT_ROOT}/scripts/build_rocshmem_device_bc.sh
+bash -x ${PROJECT_ROOT}/scripts/build_rocshmem_device_bc.sh
 
-# bash -x ${PROJECT_ROOT}/scripts/build_rocshmem_wrapper.sh
+bash -x ${PROJECT_ROOT}/scripts/build_rocshmem_wrapper.sh
 
 # build pyrocshmem
-build_pyrocshmem_setup
+#build_pyrocshmem_setup
 # build_rocshmem_hsaco
-download_and_copy
+ download_and_copy
 
 echo "done"

@@ -84,7 +84,7 @@ node_rank=${ARNOLD_ID:=0}
 #   --nnodes=${nnodes} \
 #   $@"
 
-CMD="${MPI_ROOT}/bin/mpirun --allow-run-as-root -n 2 python $@"
+CMD="${MPI_ROOT}/bin/mpirun --allow-run-as-root -n 4 python $@"
 
 echo ${CMD}
 ${CMD}
