@@ -49,34 +49,12 @@ import random
 
 def test_rocshmem_basic():
     @triton.jit
-    def _rocshmem_basic(comm_buf, ctx):
-        
+    def all_gather_kernel(ptr, ctx):
         libshmem_device.set_rocshmem_ctx(ctx)
-        # dl_my_pe = dl.rank()
-        # dl_num_ranks = dl.num_ranks()
-
-        my_pe = libshmem_device.my_pe()
-        num_pes = libshmem_device.n_pes()
-
-        # tl.store(comm_buf, dl_my_pe)
-        # comm_buf+=1
-        # tl.store(comm_buf, dl_num_ranks)
-        # comm_buf+=1
-        tl.store(comm_buf, my_pe)
-        comm_buf+=1
-        tl.store(comm_buf, num_pes)
-
-
-    @triton.jit
-    def _rocshmem_put(ptr,ctx):
-        libshmem_device.set_rocshmem_ctx(ctx)
-
         mype = libshmem_device.my_pe()
         npes = libshmem_device.n_pes()
-        peer = (mype + 1) % npes
 
-        libshmem_device.int_p(ptr, mype, peer)
-
+        
 
     print("rocshmem basic start!")
     my_pe = pyrocshmem.rocshmem_my_pe()
@@ -125,16 +103,6 @@ def test_rocshmem_basic():
     print(f"put_buf from pe#{my_pe}: {put_buf}")
 
     pyrocshmem.rocshmem_finalize()
-
-
-def test_rocshmem_getmem():
-    @triton.jit
-    def _rocshmem_getmem(ctx):
-        libshmem_device.set_rocshmem_ctx(ctx)
-
-        my_pe = libshmem_device.my_pe()
-        num_pes = libshmem_device.n_pes()
-        
 
 
 if __name__ == "__main__":

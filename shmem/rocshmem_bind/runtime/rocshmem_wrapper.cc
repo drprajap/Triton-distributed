@@ -30,7 +30,7 @@ using namespace rocshmem;
 
 extern "C" {
 
-__device__ int __attribute__((visibility("default"))) rocshmem_my_pe_kernel() {
+__device__ int __attribute__((visibility("default"))) rocshmem_my_pe_wrapper() {
   return rocshmem_my_pe();
 }
 
@@ -40,53 +40,18 @@ __device__ void __attribute__((visibility("default"))) rocshmem_set_rocshmem_ctx
   ROCSHMEM_CTX_DEFAULT.ctx_opaque = ctx;
 }
 
-__device__ int __attribute__((used)) rocshmem_n_pes_kernel() {
+__device__ int __attribute__((visibility("default"))) rocshmem_n_pes_wrapper() {
   return rocshmem_n_pes();
 }
 
-__device__ void __attribute__((used)) rocshmem_ptr_kernel(void *src,
-                                                                     void *dest,
+__device__ void __attribute__((visibility("default"))) rocshmem_ptr_wrapper(void *dest
                                                                      int pe) {
-  dest = rocshmem_ptr(src, pe);
+  return rocshmem_ptr(dest, pe);
 }
 
-__device__ void __attribute__((used)) rocshmem_int_p_kernel(
+__device__ void __attribute__((visibility("default"))) rocshmem_int_p_wrapper(
     int *dest, int value, int pe) {
   rocshmem_int_p(dest, value, pe);
 }
 
-__device__ void __attribute__((used)) rocshmem_get_next_pe_kernel(
-    int *dest) {
-  int mype = rocshmem_my_pe();
-  int npes = rocshmem_n_pes();
-  int peer = (mype + 1) % npes;
-
-  rocshmem_int_p(dest, mype, peer);
-}
-
-__device__ void testing_wrapper(int *sym_buf) {
-  int tid = threadIdx.x;
-  int mype = rocshmem_my_pe();
-
-  if (tid < 4) {
-    sym_buf[tid] = rocshmem_my_pe() + 100;
-    printf("\n testing_wrapper_kernel >> device ptr: %p mype: %d sym_buf[%d]: %d ", sym_buf, mype, tid,
-           sym_buf[tid]);
-  } else {
-    sym_buf[tid] = 501;
-    printf("\n testing_wrapper_kernel >> device ptr: %p mype: %d sym_buf[%d]: %d ", sym_buf, mype, tid,
-           sym_buf[tid]);
-  }
-}
-
-}
-extern "C" {
-
-__device__ int rocshmem_my_pe_wrapper() { return rocshmem_my_pe(); }
-
-__device__ int rocshmem_n_pes_wrapper() { return rocshmem_n_pes(); }
-
-__device__ void *rocshmem_ptr_wrapper(void *dest, int pe) {
-  return rocshmem_ptr(dest, pe);
-}
 }

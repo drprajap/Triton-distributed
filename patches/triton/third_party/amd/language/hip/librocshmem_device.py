@@ -48,7 +48,7 @@ def my_pe(_builder=None):
         "librocshmem_device",
         "",
         [],
-        {(): ("rocshmem_my_pe_kernel",(tl.int32))},
+        {(): ("rocshmem_my_pe_wrapper",(tl.int32))},
         is_pure=False,
         _builder=_builder,
     )
@@ -60,7 +60,7 @@ def n_pes(_builder=None):
         "",
         [],
         {
-            (): ("rocshmem_n_pes_kernel",(tl.int32))},
+            (): ("rocshmem_n_pes_wrapper",(tl.int32))},
         is_pure=True,
         _builder=_builder
     )
@@ -70,33 +70,36 @@ def int_p(dest, value, pe, _builder=None):
     return extern_call(
         "librocshmem_device",
         "",
-        [dest, value, pe],
+        [tl.cast(dest, tl.pointer_type(tl.void), _builder=_builder), 
+         tl.cast(value, tl.int32, _builder=_builder), 
+         tl.cast(pe, tl.int32, _builder=_builder)],
         {
-            (core.pointer_type(core.dtype("int32")), core.dtype("int32"), core.dtype("int32")):
-            ("rocshmem_int_p", core.dtype("int32")),
+            (tl.pointer_type(tl.void),
+             tl.int32,
+             tl.int32
+            ):
+            ("rocshmem_int_p_wrapper", ()),
         },
         is_pure=False,
         _builder=_builder,
-        check_args=False
     )
 
 @core.extern
-# def remote_ptr(local_ptr, pe, _builder=None):
-#     return core.extern_elementwise(
-#         "librocshmem_device", "", [local_ptr, pe], {
-#             (core.pointer_type(core.dtype("int32")), core.dtype("int32")):
-#             ("rocshmem_ptr", core.pointer_type(core.dtype("int32"))),
-#         }, is_pure=False, _builder=_builder, check_args=False)
 def remote_ptr(local_ptr, pe, _builder=None):
-    return extern_call(
+    return tl.cast(extern_call(
         "librocshmem_device",
         "",
-        [local_ptr, pe],
+        [tl.cast(local_ptr, tl.pointer_type(tl.void), _builder=_builder), 
+         tl.cast(pe, tl.int32, _builder=_builder)],
         {
-            (core.pointer_type(core.dtype("int32")), core.dtype("int32")):
-            ("rocshmem_remote_ptr", core.pointer_type(core.dtype("int32"))),
+            (tl.pointer_type(tl.void),
+             tl.int32
+            ):
+            ("rocshmem_ptr_wrapper", tl.pointer_type(tl.void)),
         },
         is_pure=False,
         _builder=_builder,
-        check_args=False
+    ),
+    local_ptr.dtype,
+        _builder=_builder,
     )
