@@ -210,13 +210,13 @@ void mlir::triton::AMD::populateDistributedOpToLLVMPatterns(
 
   // convert to rocshmem device func call
   registerGenericOpToROCSHMEMDevice<triton::distributed::GetRankOp>(
-      patterns, typeConverter, benefit, "rocshmem_my_pe_kernel", ROCSHMEMLibname,
+      patterns, typeConverter, benefit, "rocshmem_my_pe_wrapper", ROCSHMEMLibname,
       ROCSHMEMLibpath);
   registerGenericOpToROCSHMEMDevice<triton::distributed::GetNumRanksOp>(
-      patterns, typeConverter, benefit, "rocshmem_n_pes_kernel", ROCSHMEMLibname,
+      patterns, typeConverter, benefit, "rocshmem_n_pes_wrapper", ROCSHMEMLibname,
       ROCSHMEMLibpath);
   registerGenericOpToROCSHMEMDevice<triton::distributed::SymmAtOp>(
-      patterns, typeConverter, benefit, "rocshmem_ptr_kernel", ROCSHMEMLibname,
+      patterns, typeConverter, benefit, "rocshmem_ptr_wrapper", ROCSHMEMLibname,
       ROCSHMEMLibpath);
  patterns.add<ExternCallConversion>(typeConverter, benefit);
 

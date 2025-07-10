@@ -420,7 +420,6 @@ class CompiledKernel:
                 pynvshmem.nvshmemx_cumodule_init(self.module)
         elif hasattr(self.metadata, 'use_rocshmem'):
             if self.metadata.use_rocshmem:
-                #pass
                 from triton_dist import pyrocshmem
         else:
             print("Warning: No nvshmem/rocshmem imported.")

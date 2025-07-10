@@ -30,6 +30,7 @@ import os
 from typing import Optional
 import datetime
 import numpy as np
+from mpi4py import MPI
 
 from functools import partial
 
@@ -170,15 +171,25 @@ if __name__ == "__main__":
     # init
     args = parse_args()
 
-    RANK = int(os.environ.get("RANK", 0))
-    LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
-    WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
+    # RANK = int(os.environ.get("RANK", 0))
+    # LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
+    # WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
+
+    comm = MPI.COMM_WORLD
+    RANK = comm.Get_rank()
+    WORLD_SIZE = comm.Get_size()
+    LOCAL_RANK = RANK
+
+    os.environ["RANK"]  = str(RANK)
+    os.environ["WORLD_SIZE"] = str(WORLD_SIZE)
+
     torch.cuda.set_device(LOCAL_RANK)
     torch.distributed.init_process_group(
         backend="nccl",
         world_size=WORLD_SIZE,
         rank=RANK,
         timeout=datetime.timedelta(seconds=1800),
+        init_method="env://",
     )
     assert torch.distributed.is_initialized()
     TP_GROUP = torch.distributed.new_group(ranks=list(range(WORLD_SIZE)), backend="nccl")
@@ -234,7 +245,6 @@ if __name__ == "__main__":
         torch_output, torch_perf = perf_func(
             partial(torch_ag_gemm, input, weight, args.transpose_weight, bias, TP_GROUP), iters=args.iters,
             warmup_iters=args.warmup)
-
         torch.cuda.synchronize()
         torch.distributed.barrier()
 

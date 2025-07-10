@@ -57,59 +57,57 @@ class SymmHeap:
         self.hip = hip
         self.rocshmem_free = rocshmem_free
      
-    # def __del__(self):
-    #     if self.own_data:
+    def __del__(self):
+        if self.own_data:
 
-    #         err, device = self.hip.hipGetDevice()
-    #         assert err == self.hip.hipError_t.hipSuccess, f"hipError: {err}"
-    #         if device != self._device:
-    #             err, = self.hip.hipSetDevice(self._device)
-    #             assert err == self.hip.hipError_t.hipSuccess, f"hipError: {err}"
-    #         # sync
-    #         err, = self.hip.hipDeviceSynchronize()
-    #         assert err == self.hip.hipError_t.hipSuccess, f"hipError: {err}"
+            err, device = self.hip.hipGetDevice()
+            assert err == self.hip.hipError_t.hipSuccess, f"hipError: {err}"
+            if device != self._device:
+                err, = self.hip.hipSetDevice(self._device)
+                assert err == self.hip.hipError_t.hipSuccess, f"hipError: {err}"
+            # sync
+            err, = self.hip.hipDeviceSynchronize()
+            assert err == self.hip.hipError_t.hipSuccess, f"hipError: {err}"
 
-    #         self.rocshmem_free(self.ptr)
+            self.rocshmem_free(self.ptr)
 
-    #         # sync
-    #         err, = self.hip.hipDeviceSynchronize()
-    #         assert err == self.hip.hipError_t.hipSuccess
-    #         # set device back
-    #         if device != self._device:
-    #             err, = self.hip.hipSetDevice(device)
-    #             assert err == self.hip.hipError_t.hipSuccess, f"hipError: {err}"
+            # sync
+            err, = self.hip.hipDeviceSynchronize()
+            assert err == self.hip.hipError_t.hipSuccess
+            # set device back
+            if device != self._device:
+                err, = self.hip.hipSetDevice(device)
+                assert err == self.hip.hipError_t.hipSuccess, f"hipError: {err}"
 
-    #         self.own_data = False
+            self.own_data = False
 
 def symm_heap_tensor(tensor: torch.Tensor, peer: int) -> torch.Tensor:
-    print("--- symm_heap_tensor ---")
-
     if peer == rocshmem_my_pe():
         return tensor
-    buffer = SymmHeap(ptr=tensor.data_ptr(),nbytes=tensor.nbytes, dtype=tensor.dtype)
+    ptr=rocshmem_ptr(tensor.data_ptr(), peer)
+    buffer = SymmHeap(ptr,nbytes=tensor.nbytes, dtype=tensor.dtype, own_data=False)
+    t = torch.as_tensor(buffer, device="cuda").view(tensor.dtype).view(tensor.shape)
+    return  t
 
-    return torch.as_tensor(buffer, device="cuda").view(tensor.dtype).view(tensor.shape)
 
-def rocshmmem_create_tensor(shape: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
-    print("--- rocshmmem_create_tensor ---")
+def rocshmem_create_tensor(shape: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
     nbytes = torch.Size(shape).numel() * dtype.itemsize
-    print(f"my_pe: {rocshmem_my_pe()} nbytes: {nbytes}")
     torch.cuda.synchronize()
     ptr=rocshmem_malloc(nbytes)
-    buffer = SymmHeap(ptr, nbytes=nbytes, dtype=dtype)
+    buffer = SymmHeap(ptr, nbytes=nbytes, dtype=dtype, own_data=True)
     t = torch.as_tensor(buffer,device="cuda").view(dtype).view(shape)
-
+    setattr(t, "__symm_tensor__", True)
     return t
-ROCSHMEM_TEAM_WORLD = 2
-def rocshmem_create_tensor_list_intra_node(shape: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
-    print("--- rocshmem_create_tensor_list_intra_node ---")
 
-    t = rocshmmem_create_tensor(shape, dtype)
+# ROCSHMEM_TEAM_WORLD = 2
+def rocshmem_create_tensor_list_intra_node(shape: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
+    t = rocshmem_create_tensor(shape, dtype)
     # local_rank = rocshmem_team_my_pe(ROCSHMEM_TEAM_WORLD)
     rank = rocshmem_my_pe()
+    npes = rocshmem_n_pes()
     # rank_offset = rank - local_rank
-    #print(f"team_n_pes: {rocshmem_team_n_pes(ROCSHMEM_TEAM_WORLD)} local_rank: {local_rank} rank: {rank} rank_offset: {rank_offset}")
-    return [symm_heap_tensor(t, i + rank) for i in range(2)]
+    # print(f"team_n_pes: {rocshmem_team_n_pes(ROCSHMEM_TEAM_WORLD)} local_rank: {local_rank} rank: {rank} rank_offset: {rank_offset}")
+    return [symm_heap_tensor(t, i) for i in range(npes)]
 
 
 def broadcast_cpu(tensor: torch.Tensor, src: int, group: torch.distributed.ProcessGroup):

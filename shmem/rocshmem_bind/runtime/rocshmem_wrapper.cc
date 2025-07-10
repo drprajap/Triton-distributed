@@ -44,14 +44,21 @@ __device__ int __attribute__((visibility("default"))) rocshmem_n_pes_wrapper() {
   return rocshmem_n_pes();
 }
 
-__device__ void __attribute__((visibility("default"))) rocshmem_ptr_wrapper(void *dest
+__device__ void * __attribute__((visibility("default"))) rocshmem_ptr_wrapper(void *dest,
                                                                      int pe) {
-  return rocshmem_ptr(dest, pe);
+  
+  void * ptr = rocshmem_ptr(dest, pe);
+  return ptr;
 }
 
 __device__ void __attribute__((visibility("default"))) rocshmem_int_p_wrapper(
     int *dest, int value, int pe) {
   rocshmem_int_p(dest, value, pe);
+}
+
+__device__ void * __attribute__((visibility("default")))  get_device_ctx_ipc_base_wrapper(int pe){
+  void * ptr = get_device_ctx_ipc_base(pe);
+  return ptr;
 }
 
 }

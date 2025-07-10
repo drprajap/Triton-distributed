@@ -46,6 +46,9 @@ def rocshmemx_cumodule_init(module: np.intp) -> None:
 def rocshmem_get_device_ctx() -> np.intp:
     ...
 
+def rocshmem_ptr(dest: np.intp, pe: np.int32) -> np.intp:
+    ...
+
 def rocshmemx_cumodule_finalize(module: np.intp) -> None:
     ...
 
@@ -89,8 +92,8 @@ def rocshmem_barrier_all():
 def rocshmem_barrier_all_on_stream():
     ...
 
-def rocshmem_ptr(ptr, peer):
-    ...
+# def rocshmem_ptr(ptr, peer):
+#     ...
 
 # torch related
 def rocshmem_create_tensor(shape: Sequence[int], dtype: torch.dtype) -> torch.Tensor:

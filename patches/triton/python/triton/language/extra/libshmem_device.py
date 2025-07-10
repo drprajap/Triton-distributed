@@ -335,3 +335,6 @@ NVSHMEM_TEAM_INDEX_MAX = sys.maxsize
 # add rocshmem
 def set_rocshmem_ctx(ctx):
     ...
+
+def get_device_ctx_ipc_base(pe): 
+    ...

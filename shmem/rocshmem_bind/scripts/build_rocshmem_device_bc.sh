@@ -12,6 +12,7 @@ pushd ${ROCSHMEM_INSTALL_DIR}/lib
 
 # TODO: arch is hardcoded
 ${ROCM_PATH}/llvm/bin/clang++ -x hip --cuda-device-only -std=c++17  -emit-llvm  --offload-arch=gfx942 \
+ -DENABLE_IPC_BITCODE \
  -I${ROCSHMEM_INSTALL_DIR}/include \
  -I${ROCSHMEM_INSTALL_DIR}/../ \
  -I${OMPI_DIR}/include \

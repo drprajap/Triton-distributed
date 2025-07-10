@@ -37,6 +37,7 @@ from triton_dist.kernels.amd.common_ops import (
     barrier_all_on_stream,
 )
 
+from triton.language.extra import libshmem_device
 
 def cp_engine_producer_all_gather_full_mesh_push_multi_stream(
     rank,
@@ -76,6 +77,7 @@ def cp_engine_producer_all_gather_full_mesh_push_multi_stream(
             # src = local_tensor[M_src_start_pos:M_src_end_pos, :]
             src_ptr = local_tensor.data_ptr() + M_src_start_pos * N * data_elem_size
             dst_ptr = remote_tensor_buffers[remote_rank].data_ptr() + M_dst_start_pos * N * data_elem_size
+            print(f"src_ptr: {hex(src_ptr)} dst_ptr: {hex(dst_ptr)}")
             nbytes = M_PER_CHUNK * N * data_elem_size
             cp_res = hip.hipMemcpyAsync(
                 dst_ptr,
@@ -387,24 +389,51 @@ def create_ag_gemm_intra_node_context(max_M, N, K, input_dtype, output_dtype, ra
     M_per_rank = max_M // num_ranks
     assert M_per_rank % M_PER_CHUNK == 0
     dtype = input_dtype
-    workspaces = pyrocshmem.hipipc_create_tensor_list(tp_group, [max_M, K], dtype)
+    pyrocshmem.rocshmem_init()
+    shmem_ctx = pyrocshmem.rocshmem_get_device_ctx()
+    workspaces = pyrocshmem.rocshmem_create_tensor_list_intra_node([max_M, K],dtype)
 
     m_chunk_num = (max_M + M_PER_CHUNK - 1) // M_PER_CHUNK
-    barriers = pyrocshmem.hipipc_create_tensor_list(tp_group, [m_chunk_num], torch.int32)
-    barriers[rank].fill_(0)
+    barriers = pyrocshmem.rocshmem_create_tensor_list_intra_node([m_chunk_num], torch.int32)
 
-    comm_bufs = pyrocshmem.hipipc_create_tensor_list(tp_group, [num_ranks], torch.int32)
+    comm_bufs = pyrocshmem.rocshmem_create_tensor_list_intra_node([num_ranks], torch.int32)
+
+    barrier_tensor = barriers[rank]
+    barrier_tensor.fill_(0)
     comm_bufs[rank].fill_(0)
     comm_buf_ptr = torch.tensor([t.data_ptr() for t in comm_bufs], device=torch.cuda.current_device(),
                                 requires_grad=False)
+    peer = (rank + 1) % num_ranks
+    print(f"mype#: {rank} peer# {peer} ptr[{rank}]: {hex(comm_buf_ptr[rank])} ptr[{peer}]: {hex(comm_buf_ptr[peer])}")
+
+    # print("comm_buf_ptr - {}".format(hex(comm_buf_ptr[rank])))
+    # print("comm_buf_ptr - {}".format(hex(comm_buf_ptr[peer])))
+
+
+    # -------------------
+
+    # workspaces = pyrocshmem.hipipc_create_tensor_list(tp_group, [max_M, K], dtype)
+
+    # m_chunk_num = (max_M + M_PER_CHUNK - 1) // M_PER_CHUNK
+    # barriers = pyrocshmem.hipipc_create_tensor_list(tp_group, [m_chunk_num], torch.int32)
+    # barriers[rank].fill_(0)
+
+    # comm_bufs = pyrocshmem.hipipc_create_tensor_list(tp_group, [num_ranks], torch.int32)
+    # comm_bufs[rank].fill_(0)
+    # comm_buf_ptr = torch.tensor([t.data_ptr() for t in comm_bufs], device=torch.cuda.current_device(),
+    #                             requires_grad=False)
+    # print(f"4.. pr#{rank} comm_buf_ptr: {comm_buf_ptr}")
+
+    # ----------------
 
     current_stream = torch.cuda.current_stream()
 
     torch.cuda.synchronize()
-    barrier_all_on_stream(rank, num_ranks, comm_buf_ptr, current_stream)
+    barrier_all_on_stream(shmem_ctx, rank, num_ranks, comm_buf_ptr, current_stream)
 
     _ag_streams = [torch.cuda.Stream(priority=-1) for i in range(num_ranks)] if ag_streams is None else ag_streams
     _gemm_stream = current_stream if gemm_stream is None else gemm_stream
+
     one = torch.ones((1024, ), dtype=torch.int32).cuda()
 
     ret = AllGatherGEMMTensorParallelContext(

@@ -51,9 +51,9 @@ TRITON_ROCSHMEM_DIR=${SCRIPT_DIR}/shmem/rocshmem_bind/python
 PYROCSHMEM_DIR=${SCRIPT_DIR}/shmem/rocshmem_bind/pyrocshmem
 ROCSHMEM_ROOT=${SCRIPT_DIR}/shmem/rocshmem_bind/rocshmem_build/install
 MPI_ROOT=${SCRIPT_DIR}/shmem/rocshmem_bind/ompi_build/install/ompi
-
+echo "LD_LIBRARY_PATH: ${LD_LIBRARY_PATH}"
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${ROCSHMEM_ROOT}/lib:${MPI_ROOT}/lib
-echo "PYROCSHMEM_DIR: ${PYROCSHMEM_DIR}"
+echo "LD_LIBRARY_PATH: ${LD_LIBRARY_PATH}"
 # case ":${PYTHONPATH}:" in
 #     *:"${DISTRIBUTED_DIR}/python:${PYROCSHMEM_DIR}/build:${TRITON_ROCSHMEM_DIR}":*)
 #         ;;
@@ -74,7 +74,7 @@ export DEBUG_CLR_KERNARG_HDP_FLUSH_WA=1
 mkdir -p triton_cache
 
 #nproc_per_node=${ARNOLD_WORKER_GPU:=$(rocm-smi | grep W | wc -l)}
-nproc_per_node=${ARNOLD_WORKER_GPU:=8}
+nproc_per_node=${ARNOLD_WORKER_GPU:=4}
 nnodes=${ARNOLD_WORKER_NUM:=1}
 node_rank=${ARNOLD_ID:=0}
 
@@ -84,7 +84,7 @@ node_rank=${ARNOLD_ID:=0}
 #   --nnodes=${nnodes} \
 #   $@"
 
-CMD="${MPI_ROOT}/bin/mpirun --allow-run-as-root -n 4 python $@"
+CMD="${MPI_ROOT}/bin/mpirun --allow-run-as-root -n 2 -x MASTER_ADDR=127.0.0.1 -x MASTER_PORT=23456 python3 $@"
 
 echo ${CMD}
 ${CMD}

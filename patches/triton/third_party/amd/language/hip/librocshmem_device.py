@@ -103,3 +103,19 @@ def remote_ptr(local_ptr, pe, _builder=None):
     local_ptr.dtype,
         _builder=_builder,
     )
+
+@core.extern
+def get_device_ctx_ipc_base(pe, _builder=None):
+    return extern_call(
+        "librocshmem_device",
+        "",
+        [tl.cast(pe, tl.int32, _builder=_builder),],
+        {
+            (
+             tl.int32, 
+            ):
+            ("get_device_ctx_ipc_base_wrapper", tl.pointer_type(tl.void)),
+        },
+        is_pure=False,
+        _builder=_builder,
+    )
