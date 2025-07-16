@@ -186,6 +186,13 @@ if __name__ == "__main__":
         timeout=datetime.timedelta(seconds=1800),
         init_method="env://",
     )
+
+    #  torch.distributed.init_process_group(
+    #     backend="nccl",
+    #     world_size=WORLD_SIZE,
+    #     rank=RANK,
+    #     timeout=datetime.timedelta(seconds=1800),
+    # )
     assert torch.distributed.is_initialized()
     TP_GROUP = torch.distributed.new_group(ranks=list(range(WORLD_SIZE)), backend="nccl")
     torch.distributed.barrier(TP_GROUP)

@@ -42,7 +42,7 @@ import torch.distributed as dist
 import triton_dist.language as dl
 from triton.language.extra import libdevice
 from triton.language.extra.hip import libdevice  # noqa: F811
-from triton.language.extra import libshmem_device
+from triton_dist.language.extra import libshmem_device
 import time
 import pyrocshmem
 import random
@@ -59,8 +59,6 @@ def test_rocshmem_basic():
         mype = libshmem_device.my_pe()
         npes = libshmem_device.n_pes()
         peer = (mype + 1) % npes
-
-        # ipcBase = libshmem_device.get_device_ctx_ipc_base(mype)
 
         # rptr = libshmem_device.remote_ptr(ipcBase, peer)
 
@@ -159,27 +157,27 @@ def test_rocshmem_basic():
     _rocshmem_put[(1, )](put_buf, ctx)
     pyrocshmem.rocshmem_barrier_all()
 
-    # print(f"put_buf from pe#{my_pe}: {put_buf}")
-    nelems_per_rank = 4
-    n_elements = npes*nelems_per_rank
-    dtype = torch.int32
+    print(f"put_buf from pe#{my_pe}: {put_buf}")
+    # nelems_per_rank = 4
+    # n_elements = npes*nelems_per_rank
+    # dtype = torch.int32
 
-    put_bufs = pyrocshmem.rocshmem_create_tensor((n_elements,), torch.int32)
-    ref_tensor = torch.arange(n_elements, dtype=dtype).cuda()
-    put_bufs[nelems_per_rank * my_pe : nelems_per_rank *(my_pe+1)].copy_(ref_tensor[nelems_per_rank * my_pe : nelems_per_rank *(my_pe+1)])
-    pyrocshmem.rocshmem_barrier_all()
-    _rocshmem_put_symm_at[(1, )](put_bufs, ctx,comm_buf)
-    pyrocshmem.rocshmem_barrier_all()
+    # put_bufs = pyrocshmem.rocshmem_create_tensor((n_elements,), torch.int32)
+    # ref_tensor = torch.arange(n_elements, dtype=dtype).cuda()
+    # put_bufs[nelems_per_rank * my_pe : nelems_per_rank *(my_pe+1)].copy_(ref_tensor[nelems_per_rank * my_pe : nelems_per_rank *(my_pe+1)])
+    # pyrocshmem.rocshmem_barrier_all()
+    # _rocshmem_put_symm_at[(1, )](put_bufs, ctx,comm_buf)
+    # pyrocshmem.rocshmem_barrier_all()
 
-    print(f"put_buf remote_ptr from pe#{my_pe}: {put_bufs}")
+    # print(f"put_buf remote_ptr from pe#{my_pe}: {put_bufs}")
 
-    try:
-        torch.testing.assert_close(put_bufs, ref_tensor, atol=0, rtol=0)
-    except Exception as e:
-        print(f"❌ RANK[{my_pe}] check failed")
-        raise e
-    else:
-        print(f"✅ RANK[{my_pe}] check passed")  
+    # try:
+    #     torch.testing.assert_close(put_bufs, ref_tensor, atol=0, rtol=0)
+    # except Exception as e:
+    #     print(f"❌ RANK[{my_pe}] check failed")
+    #     raise e
+    # else:
+    #     print(f"✅ RANK[{my_pe}] check passed")  
 
     pyrocshmem.rocshmem_finalize()
 

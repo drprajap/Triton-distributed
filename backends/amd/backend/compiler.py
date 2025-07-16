@@ -10,6 +10,7 @@ from typing import Any, Dict, Tuple
 from types import ModuleType
 import hashlib
 import tempfile
+import os
 import re
 import subprocess
 import functools
@@ -85,7 +86,9 @@ class HIPOptions:
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
         for lib in ["ocml", "ockl"]:
             extern_libs[lib] = str(default_libdir / f'{lib}.bc')
+
         rocshmem_device_lib = str(default_libdir / 'librocshmem_device.bc')
+
         object.__setattr__(self, 'extern_libs', tuple(extern_libs.items()))
         object.__setattr__(self, 'rocshmem_device_lib', rocshmem_device_lib)
 
@@ -151,7 +154,7 @@ class HIPBackend(BaseBackend):
         from triton.language.extra.hip import librocshmem_device
 
         return {"triton.language.extra.libdevice": libdevice,
-                "triton.language.extra.libshmem_device": librocshmem_device}
+                "triton_dist.language.extra.libshmem_device": librocshmem_device}
 
     def load_dialects(self, ctx):
         distributed.ir.load_dialects(ctx)
@@ -183,12 +186,6 @@ class HIPBackend(BaseBackend):
         if knobs.amd.use_buffer_ops and ty == "tensor" and HIPBackend.is_within_2gb(arg):
             ret += "S"
         return ret
-
-    @staticmethod
-    def path_to_rocshmem_bc():
-        rocshmem_libdir = Path(__file__).parent / 'lib'
-        rocshmem_device_lib = str(rocshmem_libdir / 'librocshmem_device.bc')
-        return rocshmem_device_lib
 
     @staticmethod
     def path_to_rocm_lld():
@@ -411,7 +408,6 @@ class HIPBackend(BaseBackend):
             llvm.link_extern_libs(llvm_mod, paths)
         if options.rocshmem_device_lib and metadata['use_rocshmem']:
             llvm.link_extern_libs(llvm_mod, [options.rocshmem_device_lib])
-            #llvm.link_extern_libs(llvm_mod, [options.rocshmemwrapper_device_lib])
 
         llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, '', [], options.enable_fp_fusion)
 

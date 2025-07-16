@@ -23,38 +23,39 @@
 #
 ################################################################################
 from triton.language import core
+from triton_dist.language import core as dist_core
 import triton.language as tl
-from triton_dist.core import extern_call
+from triton_dist.language.core import extern_call
 import sys
 
 @core.extern
-def set_rocshmem_ctx(ctx, _builder=None):
+def set_rocshmem_ctx(ctx, _semantic=None):
     return extern_call(
         "librocshmem_device",
         "",
         [
-            tl.cast(ctx, tl.pointer_type(tl.void), _builder=_builder),
+            tl.cast(ctx, tl.pointer_type(tl.void), _semantic=_semantic),
         ],
         {(tl.pointer_type(tl.void), ): (
              "rocshmem_set_rocshmem_ctx",()
          ),},
         is_pure=False,
-        _builder=_builder,
+        _semantic=_semantic,
     )
 
 @core.extern
-def my_pe(_builder=None):
+def my_pe(_semantic=None):
     return extern_call(
         "librocshmem_device",
         "",
         [],
         {(): ("rocshmem_my_pe_wrapper",(tl.int32))},
         is_pure=False,
-        _builder=_builder,
+        _semantic=_semantic,
     )
 
 @core.extern
-def n_pes(_builder=None):
+def n_pes(_semantic=None):
     return extern_call(
         "librocshmem_device",
         "",
@@ -62,17 +63,17 @@ def n_pes(_builder=None):
         {
             (): ("rocshmem_n_pes_wrapper",(tl.int32))},
         is_pure=True,
-        _builder=_builder
+        _semantic=_semantic
     )
 
 @core.extern
-def int_p(dest, value, pe, _builder=None):
+def int_p(dest, value, pe, _semantic=None):
     return extern_call(
         "librocshmem_device",
         "",
-        [tl.cast(dest, tl.pointer_type(tl.void), _builder=_builder), 
-         tl.cast(value, tl.int32, _builder=_builder), 
-         tl.cast(pe, tl.int32, _builder=_builder)],
+        [tl.cast(dest, tl.pointer_type(tl.void), _semantic=_semantic), 
+         tl.cast(value, tl.int32, _semantic=_semantic), 
+         tl.cast(pe, tl.int32, _semantic=_semantic)],
         {
             (tl.pointer_type(tl.void),
              tl.int32,
@@ -81,16 +82,16 @@ def int_p(dest, value, pe, _builder=None):
             ("rocshmem_int_p_wrapper", ()),
         },
         is_pure=False,
-        _builder=_builder,
+        _semantic=_semantic,
     )
 
 @core.extern
-def remote_ptr(local_ptr, pe, _builder=None):
+def remote_ptr(local_ptr, pe, _semantic=None):
     return tl.cast(extern_call(
         "librocshmem_device",
         "",
-        [tl.cast(local_ptr, tl.pointer_type(tl.void), _builder=_builder), 
-         tl.cast(pe, tl.int32, _builder=_builder)],
+        [tl.cast(local_ptr, tl.pointer_type(tl.void), _semantic=_semantic), 
+         tl.cast(pe, tl.int32, _semantic=_semantic)],
         {
             (tl.pointer_type(tl.void),
              tl.int32
@@ -98,24 +99,8 @@ def remote_ptr(local_ptr, pe, _builder=None):
             ("rocshmem_ptr_wrapper", tl.pointer_type(tl.void)),
         },
         is_pure=False,
-        _builder=_builder,
+        _semantic=_semantic,
     ),
     local_ptr.dtype,
-        _builder=_builder,
-    )
-
-@core.extern
-def get_device_ctx_ipc_base(pe, _builder=None):
-    return extern_call(
-        "librocshmem_device",
-        "",
-        [tl.cast(pe, tl.int32, _builder=_builder),],
-        {
-            (
-             tl.int32, 
-            ):
-            ("get_device_ctx_ipc_base_wrapper", tl.pointer_type(tl.void)),
-        },
-        is_pure=False,
-        _builder=_builder,
+        _semantic=_semantic,
     )

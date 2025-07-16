@@ -42,7 +42,7 @@ import torch.distributed as dist
 import triton_dist.language as dl
 from triton.language.extra import libdevice
 from triton.language.extra.hip import libdevice  # noqa: F811
-from triton.language.extra import libshmem_device
+from triton_dist.language.extra import libshmem_device
 import time
 import pyrocshmem
 import random

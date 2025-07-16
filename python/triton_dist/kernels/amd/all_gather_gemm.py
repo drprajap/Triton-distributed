@@ -36,7 +36,7 @@ import pyrocshmem
 from triton_dist.kernels.amd.common_ops import (
     barrier_all_ipc, )
 
-from triton.language.extra import libshmem_device
+from triton_dist.language.extra import libshmem_device
 
 def cp_engine_producer_all_gather_full_mesh_push_multi_stream(
     rank,

@@ -6,7 +6,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 export ROCSHMEM_INSTALL_DIR=${ROCSHMEM_INSTALL_DIR:-${SCRIPT_DIR}/../rocshmem_build/install}
 export ROCSHMEM_SRC=${ROCSHMEM_SRC:-${SCRIPT_DIR}/../../../3rdparty/rocshmem}
 export ROCM_PATH=/opt/rocm-6.3.0/lib
-export OMPI_DIR=${OMPI_DIR:-${SCRIPT_DIR}/../ompi_build/install/ompi}
+export OMPI_DIR=/opt/ompi_build/install/ompi
 
 pushd ${ROCSHMEM_INSTALL_DIR}/lib
 

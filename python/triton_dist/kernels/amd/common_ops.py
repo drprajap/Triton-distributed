@@ -36,7 +36,7 @@ from triton.language.extra.hip.libdevice import (
     load_acquire_system,
 )
 
-from triton.language.extra import libshmem_device
+from triton_dist.language.extra import libshmem_device
 
 
 @triton.jit

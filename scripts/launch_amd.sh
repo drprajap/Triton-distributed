@@ -92,14 +92,14 @@ fi
 
 additional_args="--rdzv_endpoint=${master_addr}:${master_port}"
 
-CMD="torchrun \
-  --node_rank=${node_rank} \
-  --nproc_per_node=${nproc_per_node} \
-  --nnodes=${nnodes} \
-  ${additional_args} \
-  $@"
+# CMD="torchrun \
+#   --node_rank=${node_rank} \
+#   --nproc_per_node=${nproc_per_node} \
+#   --nnodes=${nnodes} \
+#   ${additional_args} \
+#   $@"
 
-  # CMD="${MPI_ROOT}/bin/mpirun --allow-run-as-root -n 2 -x MASTER_ADDR=127.0.0.1 -x MASTER_PORT=23456 python3 $@"
+  CMD="${MPI_ROOT}/bin/mpirun --allow-run-as-root -n 2 -x MASTER_ADDR=127.0.0.1 -x MASTER_PORT=23456 python3 $@"
 
 
 echo ${CMD}
