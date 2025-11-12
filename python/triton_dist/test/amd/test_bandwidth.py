@@ -83,7 +83,8 @@ import triton
 import triton.language as tl
 from hip import hip
 from triton_dist.utils import HIP_CHECK
-import pyrocshmem
+# NOTE: pyrocshmem must be imported AFTER setting ROCSHMEM_HEAP_SIZE
+# import pyrocshmem  # Moved to main() after setting env var
 from triton_dist.utils import group_profile, perf_func
 import gc
 
@@ -459,6 +460,7 @@ def parse_args():
     parser.add_argument("--check", action="store_true", help="Enable correctness check")
     parser.add_argument("--profile", action="store_true",
                         help="Enable PyTorch Profiler for a fixed size (M=1024, K=8192)")
+    parser.add_argument("--heap_size", type=int, default=16, help="ROCm SHMEM heap size in GB (default: 16)")
     return parser.parse_args()
 
 
@@ -608,6 +610,18 @@ def main():
     RANK = int(os.environ.get("RANK", 0))
     LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
     WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
+
+    # Set ROCm SHMEM heap size BEFORE importing pyrocshmem (in bytes)
+    # rocSHMEM reads this env var during static initialization
+    heap_size_bytes = args.heap_size * 1024 * 1024 * 1024
+    os.environ['ROCSHMEM_HEAP_SIZE'] = str(heap_size_bytes)
+    if RANK == 0:
+        print(f"Setting ROCSHMEM_HEAP_SIZE to {args.heap_size} GB ({heap_size_bytes} bytes)")
+    
+    # Import pyrocshmem AFTER setting environment variable
+    # Make it global so helper functions can access it
+    global pyrocshmem
+    import pyrocshmem
 
     torch.cuda.set_device(LOCAL_RANK)
     torch.distributed.init_process_group(backend="nccl", world_size=WORLD_SIZE, rank=RANK,
