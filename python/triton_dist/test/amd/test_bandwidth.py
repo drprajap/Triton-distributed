@@ -72,7 +72,7 @@ Size (MB)  Shape           CP Engine (GB/s) (ms)     Copy Kernel (GB/s) (ms)    
 """
 
 import torch.distributed
-from python.triton_dist.utils import sleep_async
+from triton_dist.utils import sleep_async
 import torch
 import torch.profiler
 import argparse
@@ -85,7 +85,7 @@ from hip import hip
 from triton_dist.utils import HIP_CHECK
 import pyrocshmem
 from triton_dist.utils import group_profile, perf_func
-
+import gc
 
 @triton.jit
 def copy_kernel_2d(
@@ -161,16 +161,16 @@ def test_cp_engine_push_allgather_bandwidth(
     """Test CP Engine bandwidth using multi-stream push-mode AllGather."""
     local_tensor_size = local_tensor.numel() * local_tensor.element_size()
     my_data_offset_bytes = rank * local_tensor_size
-    num_streams = len(streams)
 
     def run_allgather():
-        current_stream = torch.cuda.current_stream()
-        for s in streams:
-            current_stream.wait_stream(s)
+        # Launch all async copies on dedicated streams - maximize parallelism!
+        stream_idx = 0
         for target_rank in range(num_ranks):
             if target_rank == rank:
                 continue
-            stream = streams[target_rank % num_streams]
+            # Use dedicated stream per destination GPU
+            stream = streams[stream_idx]
+            stream_idx += 1
             dest_ptr = remote_tensors[target_rank].data_ptr() + my_data_offset_bytes
 
             cp_res = hip.hipMemcpyAsync(
@@ -181,8 +181,9 @@ def test_cp_engine_push_allgather_bandwidth(
                 stream.cuda_stream,
             )
             HIP_CHECK(cp_res)
-        for s in streams:
-            s.wait_stream(current_stream)
+        
+        # Synchronize ALL GPU work (including all streams)
+        torch.cuda.synchronize()
 
     # get data
     remote_tensors[rank].fill_(0)
@@ -208,7 +209,7 @@ def test_copy_kernel_push_allgather_bandwidth(
     local_tensor: torch.Tensor,
     remote_tensors: List[torch.Tensor],
     streams: List[torch.cuda.Stream],
-    M_PER_CHUNK: int = 1024,
+    comm_buf_ptr: torch.Tensor,
     warmup_iters: int = 5,
     test_iters: int = 10,
     num_sms: int = 56,
@@ -245,6 +246,8 @@ def test_copy_kernel_push_allgather_bandwidth(
             BLOCK_SIZE_M=128,
             BLOCK_SIZE_N=256,
         )
+        # Synchronize to ensure kernel completes
+        torch.cuda.synchronize()
 
     # get data
     remote_tensors[rank].fill_(0)
@@ -314,6 +317,7 @@ def test_cp_engine_push_p2p_bandwidth(
             current_stream.cuda_stream,
         )
         HIP_CHECK(cp_res)
+        torch.cuda.synchronize()  # Ensure transfer completes
 
     # get data
     M_per_rank = local_tensor.shape[0]
@@ -423,6 +427,7 @@ def test_copy_kernel_p2p_bandwidth(
             BLOCK_SIZE_M=128,
             BLOCK_SIZE_N=256,
         )
+        torch.cuda.synchronize()  # Ensure kernel completes
 
     # get data
     M_per_rank = local_tensor.shape[0]
@@ -477,7 +482,9 @@ def run_ag_single_test(M, K, dtype, RANK, WORLD_SIZE, TP_GROUP, comm_buf_ptr, ar
     torch.manual_seed(42 + RANK)
     local_tensor = torch.randn(M, K, dtype=dtype, device=torch.cuda.current_device())
     workspace_tensors = pyrocshmem.rocshmem_create_tensor_list_intra_node([M * WORLD_SIZE, K], dtype)
-    num_streams = min(WORLD_SIZE, args.num_streams)
+    # Create one high-priority stream per destination GPU (excluding self)
+    # priority=-1 gives highest priority for better GPU scheduling
+    num_streams = WORLD_SIZE - 1
     multi_streams = [torch.cuda.Stream(priority=-1) for _ in range(num_streams)]
 
     tensor_size_mb = local_tensor.numel() * local_tensor.element_size() / (1024**2)
@@ -684,6 +691,15 @@ def main():
             if args.check: row += " reference"
             print(row)
             print(f"{'='*len(header)}")
+
+    # Explicitly delete rocSHMEM-backed tensors before finalization
+    # Without explicit cleanup, rocshmem barrier_all collective operation
+    # is called during python shutdown when some ranks may already have exited
+    del comm_bufs
+    del comm_buf_ptr
+    gc.collect()
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
 
     pyrocshmem.rocshmem_finalize()
     torch.distributed.destroy_process_group()
