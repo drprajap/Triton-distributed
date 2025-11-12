@@ -243,8 +243,8 @@ def test_copy_kernel_push_allgather_bandwidth(
             remote_tensors[0].stride(0),
             remote_tensors[0].stride(1),
             dtype=tl.float16 if local_tensor.dtype == torch.float16 else tl.bfloat16,
-            BLOCK_SIZE_M=128,
-            BLOCK_SIZE_N=256,
+            BLOCK_SIZE_M=256,
+            BLOCK_SIZE_N=128,
         )
         # Synchronize to ensure kernel completes
         torch.cuda.synchronize()
@@ -405,7 +405,7 @@ def test_copy_kernel_p2p_bandwidth(
     for i in range(num_ranks):
         dst_tensor_ptrs[i] = remote_tensors[i].data_ptr()
 
-    # Use 2D grid: (num_ranks, num_sms // (num_ranks - 1))
+    # Use 1D grid for P2P kernel (copy_kernel_p2p only uses axis=0)
     assert num_sms % (num_ranks - 1) == 0, "num_sms must be divisible by (num_ranks - 1)"
     grid = (num_sms // (num_ranks - 1), )
     M_PER_CHUNK = M  # TODO: fix it
@@ -424,8 +424,8 @@ def test_copy_kernel_p2p_bandwidth(
             remote_tensors[0].stride(0),
             remote_tensors[0].stride(1),
             dtype=tl.float16 if local_tensor.dtype == torch.float16 else tl.bfloat16,
-            BLOCK_SIZE_M=128,
-            BLOCK_SIZE_N=256,
+            BLOCK_SIZE_M=256,
+            BLOCK_SIZE_N=128,
         )
         torch.cuda.synchronize()  # Ensure kernel completes
 
