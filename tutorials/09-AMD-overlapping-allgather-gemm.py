@@ -42,9 +42,11 @@ In doing so, you will learn about:
 
 """
 
+import argparse
 import os
 import datetime
 import numpy as np
+import statistics
 import torch
 import triton
 import triton.language as tl
@@ -335,6 +337,7 @@ class triton_ag_gemm_intra_node(torch.nn.Module):
         M_PER_CHUNK: int,
         input_dtype: torch.dtype,
         output_dtype: torch.dtype,
+        num_sms_override: Optional[int] = None,
     ):
         self.tp_group = tp_group
         self.rank: int = tp_group.rank()
@@ -345,6 +348,7 @@ class triton_ag_gemm_intra_node(torch.nn.Module):
         self.M_PER_CHUNK = M_PER_CHUNK
         self.input_dtype = input_dtype
         self.output_dtype = output_dtype
+        self.num_sms_override = num_sms_override
 
         # Use the auxiliary functions provided by Triton-distributed to construct the context required for AG-GEMM. This simplifies the code logic.
         # The context mainly includes:
@@ -393,7 +397,7 @@ class triton_ag_gemm_intra_node(torch.nn.Module):
         torch.cuda.synchronize()
         torch.distributed.barrier()
         # consumer gemm
-        NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
+        NUM_SMS = self.num_sms_override if self.num_sms_override is not None else torch.cuda.get_device_properties(0).multi_processor_count
         NUM_XCDS = 4
 
         grid = lambda META: (min(
@@ -496,7 +500,91 @@ def destroy():
     torch.distributed.destroy_process_group()
 
 
+def parse_args():
+    p = argparse.ArgumentParser(description="AG+GEMM overlap benchmark")
+    p.add_argument("--M", type=int, default=8192)
+    p.add_argument("--N", type=int, default=11008)
+    p.add_argument("--K", type=int, default=4096)
+    p.add_argument("--chunk-size", type=int, default=256)
+    p.add_argument("--dtype", choices=["float16", "bfloat16"], default="float16")
+    p.add_argument("--warmup", type=int, default=3)
+    p.add_argument("--repeats", type=int, default=10)
+    p.add_argument("--compare-scheduling", action="store_true",
+                   help="Compare static vs dynamic NUM_SMS launch")
+    p.add_argument("--num-sms-override", type=int, default=None,
+                   help="Run a single mode with explicit NUM_SMS")
+    p.add_argument("--dynamic-active-cus", type=int, default=272,
+                   help="NUM_SMS used for dynamic scheduling mode")
+    p.add_argument("--skip-correctness", action="store_true")
+    return p.parse_args()
+
+
+def benchmark_mode(
+    mode_name: str,
+    tp_group: torch.distributed.ProcessGroup,
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    ref_out: Optional[torch.Tensor],
+    max_m: int,
+    n: int,
+    k: int,
+    chunk_size: int,
+    input_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+    num_sms_override: int,
+    warmup: int,
+    repeats: int,
+    check_correctness: bool,
+):
+    op = triton_ag_gemm_intra_node(
+        tp_group,
+        max_m,
+        n,
+        k,
+        chunk_size,
+        input_dtype,
+        output_dtype,
+        num_sms_override=num_sms_override,
+    )
+
+    # Warmup
+    for _ in range(warmup):
+        _ = op.forward(input_tensor, weight, False)
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+
+    # Timed repeats
+    latencies_ms = []
+    last_out = None
+    for _ in range(repeats):
+        t0 = datetime.datetime.now()
+        last_out = op.forward(input_tensor, weight, False)
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        t1 = datetime.datetime.now()
+        latencies_ms.append((t1 - t0).total_seconds() * 1000.0)
+
+    # Optional correctness check
+    correct = True
+    if check_correctness and ref_out is not None:
+        correct = torch.allclose(last_out, ref_out, atol=1e-2, rtol=1e-2)
+
+    # Cleanup explicit rocSHMEM-backed tensors
+    del op
+    return {
+        "mode": mode_name,
+        "num_sms": num_sms_override,
+        "latencies_ms": latencies_ms,
+        "median_ms": statistics.median(latencies_ms),
+        "mean_ms": statistics.mean(latencies_ms),
+        "std_ms": statistics.pstdev(latencies_ms) if len(latencies_ms) > 1 else 0.0,
+        "correct": correct,
+    }
+
+
 if __name__ == "__main__":
+    args = parse_args()
+
     # init
     RANK, LOCAL_RANK, WORLD_SIZE, TP_GROUP = init()
     pyrocshmem.init_rocshmem_by_uniqueid(TP_GROUP)
@@ -504,17 +592,15 @@ if __name__ == "__main__":
     # NOTE: We should get device after process group init.
     DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
-    dtype = torch.float16
-    M = 8192
-    N = 11008
-    K = 4096
-    chunk_size = 256
+    dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
+    M = args.M
+    N = args.N
+    K = args.K
+    chunk_size = args.chunk_size
     local_M = M // WORLD_SIZE
     local_N = N // WORLD_SIZE
     input_dtype = dtype
     output_dtype = input_dtype
-    atol = 1e-2
-    rtol = 1e-2
 
     # Generate input and weight.
     scale = TP_GROUP.rank() + 1
@@ -526,29 +612,83 @@ if __name__ == "__main__":
     generator = generate_data(data_config)
     input, weight, bias = next(generator)
 
-    # torch
-    ref_out = torch_ag_gemm(input, weight, False, bias, TP_GROUP)
-    torch.cuda.synchronize()
-    torch.distributed.barrier()
+    # Reference output (optional)
+    ref_out = None
+    if not args.skip_correctness:
+        ref_out = torch_ag_gemm(input, weight, False, bias, TP_GROUP)
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
 
-    # dist triton
-    dist_ag_gemm_op = triton_ag_gemm_intra_node(TP_GROUP, M, N, K, chunk_size,
-                                                input_dtype, output_dtype)
-    tri_out = dist_ag_gemm_op.forward(input, weight, False)
+    total_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    dynamic_sms = max(1, min(args.dynamic_active_cus, total_sms))
 
-    if torch.allclose(tri_out, ref_out, atol=atol, rtol=rtol):
-        dist_print("✅ Triton and Torch match")
+    results = []
+    if args.compare_scheduling:
+        results.append(
+            benchmark_mode(
+                "static",
+                TP_GROUP,
+                input,
+                weight,
+                ref_out,
+                M,
+                N,
+                K,
+                chunk_size,
+                input_dtype,
+                output_dtype,
+                total_sms,
+                args.warmup,
+                args.repeats,
+                not args.skip_correctness,
+            ))
+        results.append(
+            benchmark_mode(
+                "dynamic",
+                TP_GROUP,
+                input,
+                weight,
+                ref_out,
+                M,
+                N,
+                K,
+                chunk_size,
+                input_dtype,
+                output_dtype,
+                dynamic_sms,
+                args.warmup,
+                args.repeats,
+                False,
+            ))
     else:
-        dist_print(
-            f"The maximum difference between torch and triton is {torch.max(torch.abs(tri_out - ref_out))}"
-        )
-        dist_print("❌ Triton and Torch differ")
+        single_mode_sms = total_sms if args.num_sms_override is None else max(
+            1, min(args.num_sms_override, total_sms))
+        results.append(
+            benchmark_mode(
+                "default",
+                TP_GROUP,
+                input,
+                weight,
+                ref_out,
+                M,
+                N,
+                K,
+                chunk_size,
+                input_dtype,
+                output_dtype,
+                single_mode_sms,
+                args.warmup,
+                args.repeats,
+                not args.skip_correctness,
+            ))
 
-    # Explicitly delete rocSHMEM-backed tensors before finalization
-    # without explicit cleanup, rocshmem barrier_all collective operation
-    # is called during python shutdown when some ranks may already have exited,
-    # which may cause segfaults.
-    del dist_ag_gemm_op
+    if RANK == 0:
+        print("\n=== AG+GEMM Benchmark Summary ===")
+        print(f"Shape: M={M}, N={N}, K={K}, chunk={chunk_size}, repeats={args.repeats}")
+        print(f"{'Mode':<10} {'NUM_SMS':>8} {'Median(ms)':>12} {'Mean(ms)':>10} {'Std(ms)':>9} {'Correct':>9}")
+        for r in results:
+            print(f"{r['mode']:<10} {r['num_sms']:>8} {r['median_ms']:>12.3f} {r['mean_ms']:>10.3f} {r['std_ms']:>9.3f} {str(r['correct']):>9}")
+
     pyrocshmem.rocshmem_finalize()
     # After all, destroy distributed process group.
     destroy()
