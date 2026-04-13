@@ -88,6 +88,7 @@ class AGGemmRunner:
         weight: torch.Tensor,
         ag_streams: List,
         compute_stream,
+        gemm_iters: int = 1,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
 
@@ -117,27 +118,28 @@ class AGGemmRunner:
                     triton.cdiv(self.M, META["BLOCK_SIZE_M"]) * triton.cdiv(N_per_rank, META["BLOCK_SIZE_N"]),
                 ),
             )
-            t09.consumer_gemm_persistent_kernel[grid](
-                full_input,
-                input_tensor,
-                weight,
-                output,
-                self.M,
-                N_per_rank,
-                self.K,
-                full_input.stride(0),
-                full_input.stride(1),
-                weight.stride(1),
-                weight.stride(0),
-                output.stride(0),
-                output.stride(1),
-                self.ctx.rank,
-                self.ctx.num_ranks,
-                self.ctx.barrier_tensors[self.ctx.rank],
-                M_PER_CHUNK=self.ctx.M_PER_CHUNK,
-                NUM_SMS=self.num_sms,
-                NUM_XCDS=4,
-            )
+            for _ in range(gemm_iters):
+                t09.consumer_gemm_persistent_kernel[grid](
+                    full_input,
+                    input_tensor,
+                    weight,
+                    output,
+                    self.M,
+                    N_per_rank,
+                    self.K,
+                    full_input.stride(0),
+                    full_input.stride(1),
+                    weight.stride(1),
+                    weight.stride(0),
+                    output.stride(0),
+                    output.stride(1),
+                    self.ctx.rank,
+                    self.ctx.num_ranks,
+                    self.ctx.barrier_tensors[self.ctx.rank],
+                    M_PER_CHUNK=self.ctx.M_PER_CHUNK,
+                    NUM_SMS=self.num_sms,
+                    NUM_XCDS=4,
+                )
 
         return output
 
@@ -153,6 +155,8 @@ def parse_args():
     p.add_argument("--repeats", type=int, default=10)
     p.add_argument("--num-ag-streams", type=int, default=4)
     p.add_argument("--num-sms", type=int, default=272, help="Constrained NUM_SMS for GEMM kernel")
+    p.add_argument("--gemm-iters", type=int, default=1,
+                   help="Repeat GEMM kernel N times per timed iteration for longer compute phase")
     p.add_argument("--modes", default="unmasked,cu-masked", help="Comma-separated: unmasked,cu-masked")
     p.add_argument("--strategy", choices=["interleaved", "sequential", "block", "ratio"], default="interleaved")
     p.add_argument("--comm-ratio", type=float, default=0.3)
@@ -170,11 +174,12 @@ def benchmark_mode(
     warmup: int,
     repeats: int,
     ref_out: Optional[torch.Tensor],
+    gemm_iters: int = 1,
 ) -> ModeResult:
     ag_streams, compute_stream, cleanup, metadata = build_streams()
     try:
         for _ in range(warmup):
-            _ = runner.run_one(input_tensor, weight, ag_streams, compute_stream)
+            _ = runner.run_one(input_tensor, weight, ag_streams, compute_stream, gemm_iters)
             torch.cuda.synchronize()
             torch.distributed.barrier()
 
@@ -183,7 +188,7 @@ def benchmark_mode(
         for _ in range(repeats):
             torch.distributed.barrier()
             start = datetime.datetime.now()
-            last_out = runner.run_one(input_tensor, weight, ag_streams, compute_stream)
+            last_out = runner.run_one(input_tensor, weight, ag_streams, compute_stream, gemm_iters)
             torch.cuda.synchronize()
             torch.distributed.barrier()
             end = datetime.datetime.now()
@@ -285,6 +290,7 @@ def main():
                 args.warmup,
                 args.repeats,
                 ref_out,
+                gemm_iters=args.gemm_iters,
             ))
 
     if "cu-masked" in mode_list:
@@ -312,13 +318,14 @@ def main():
                 args.warmup,
                 args.repeats,
                 ref_out,
+                gemm_iters=args.gemm_iters,
             ))
 
     if RANK == 0:
         print("\n=== CU-Masked AG+GEMM Results ===")
         print(
             f"Shape: M={args.M}, N={args.N}, K={args.K}, chunk={args.chunk_size}, "
-            f"num_sms={constrained_sms}, repeats={args.repeats}, modes={','.join(mode_list)}"
+            f"num_sms={constrained_sms}, gemm_iters={args.gemm_iters}, repeats={args.repeats}, modes={','.join(mode_list)}"
         )
         print(f"{'Mode':<12} {'Median(ms)':>12} {'Mean(ms)':>10} {'Std(ms)':>10} {'CommCUs':>8} {'CompCUs':>8} {'Correct':>8}")
         baseline = results[0].median_ms if results else 1.0

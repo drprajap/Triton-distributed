@@ -8,7 +8,7 @@ from pathlib import Path
 SUMMARY_MARKER = "=== CU-Masked AG+GEMM Results ==="
 SHAPE_RE = re.compile(
     r"Shape:\s*M=(?P<M>\d+),\s*N=(?P<N>\d+),\s*K=(?P<K>\d+),\s*chunk=(?P<chunk>\d+),\s*"
-    r"num_sms=(?P<num_sms>\d+),\s*repeats=(?P<repeats>\d+),\s*modes=(?P<modes>.+)$"
+    r"num_sms=(?P<num_sms>\d+),\s*(?:gemm_iters=(?P<gemm_iters>\d+),\s*)?repeats=(?P<repeats>\d+),\s*modes=(?P<modes>.+)$"
 )
 ROW_RE = re.compile(
     r"^\s*(?P<mode>[a-zA-Z\-]+)\s+"
@@ -53,7 +53,9 @@ def parse_one(path: Path):
                     r.update(shape)
                     r["source_log"] = str(path)
                     for k in ("M", "N", "K", "chunk", "num_sms", "repeats"):
-                        r[k] = int(r[k])
+                        if k in r and r[k] is not None:
+                            r[k] = int(r[k])
+                    r["gemm_iters"] = int(r.get("gemm_iters") or 1)
                     for k in ("median_ms", "mean_ms", "std_ms"):
                         r[k] = float(r[k])
                     r["comm_cus"] = None if r["comm_cus"] == "-" else int(r["comm_cus"])
@@ -93,6 +95,7 @@ def write_csv(rows, out_path: Path):
         "K",
         "chunk",
         "num_sms",
+        "gemm_iters",
         "repeats",
         "modes",
         "mode",
@@ -112,8 +115,8 @@ def write_csv(rows, out_path: Path):
 
 def write_md(rows, out_path: Path):
     lines = []
-    lines.append("| source_log | M | N | K | num_sms | repeats | mode | median_ms | std_ms | comm_cus | compute_cus | correct | unmasked/masked |")
-    lines.append("|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---|---:|")
+    lines.append("| source_log | M | N | K | num_sms | gemm_iters | repeats | mode | median_ms | std_ms | comm_cus | compute_cus | correct | unmasked/masked |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---|---:|")
     for r in rows:
         ratio = r["unmasked_vs_masked_speedup"]
         ratio_str = f"{ratio:.3f}x" if isinstance(ratio, float) else "-"
@@ -121,7 +124,7 @@ def write_md(rows, out_path: Path):
         comp = "-" if r["compute_cus"] is None else str(r["compute_cus"])
         lines.append(
             f"| {Path(r['source_log']).name} | {r['M']} | {r['N']} | {r['K']} | {r['num_sms']} | "
-            f"{r['repeats']} | {r['mode']} | {r['median_ms']:.3f} | {r['std_ms']:.3f} | "
+            f"{r.get('gemm_iters', 1)} | {r['repeats']} | {r['mode']} | {r['median_ms']:.3f} | {r['std_ms']:.3f} | "
             f"{comm} | {comp} | {r['correct']} | {ratio_str} |"
         )
     out_path.write_text("\n".join(lines) + "\n")
