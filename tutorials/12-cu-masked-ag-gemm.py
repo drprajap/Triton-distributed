@@ -83,12 +83,14 @@ def producer_ag_cu_kernel(
             dst_view = remote_flat[M_dst_start * N: M_dst_start * N + n_elements]
 
             grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-            cu_copy_kernel[grid](src_view, dst_view, n_elements, BLOCK_SIZE=BLOCK_SIZE)
 
             if isinstance(ag_stream, CUMaskedStreamWrapper):
                 stream_ptr = ag_stream._hip_stream
             else:
                 stream_ptr = ag_stream.cuda_stream if hasattr(ag_stream, 'cuda_stream') else 0
+
+            with torch.cuda.stream(ag_stream):
+                cu_copy_kernel[grid](src_view, dst_view, n_elements, BLOCK_SIZE=BLOCK_SIZE)
 
             cp_res = hip.hipMemcpyAsync(
                 barrier_buffers[remote_rank].data_ptr() + chunk_pos * barrier_elem_size,
