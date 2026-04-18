@@ -22,12 +22,12 @@ The `hipExtStreamCreateWithCUMask` mechanism causes a **2.18x on-device kernel e
 3. **No inter-kernel gaps**: Kernels dispatch back-to-back (0 us gap) on both streams.
 4. **Bimodal execution pattern**: CU-masked kernels show alternating ~1.26 ms and ~1.80 ms iterations, suggesting workgroup scheduling instability with CU masks.
 
-The slowdown is NOT caused by:
-- ~~HW dispatch counter bug~~ (previously hypothesized) — the overhead persists even when grid = masked CU count
-    1. **HW dispatch counter bug (slides 15-17 of Dynamic Work):** The SE workgroup dispatch counters read 
-    `CC_GC_SHADER_ARRAY_CONFIG` which reflects physical CUs, not masked CUs. When masked CUs in an SE fill up, the 
-    counter hasn't zeroed, so the dispatch "baton" never passes to the next SE — stalling WG dispatch even though 
-    other SEs have free CUs.
+**Confirmed root cause: HW dispatch counter bug** (discussion with Muhammad Osama):
+- The SE workgroup dispatch counters read `CC_GC_SHADER_ARRAY_CONFIG` which reflects **physical CUs, not masked CUs**. When round-robin dispatch hits a CU-masked (but physically present) CU, no dummy WG is scheduled — the counter never zeros — the dispatch "baton" never passes to the next SE. This creates intermittent deadlocks during WG scheduling.
+- The slowdown is **proportional to compute density**: BW-limited kernels show 1.00x (stalls hidden under memory latency), 64 FMAs/element → 1.28x, 1024 FMAs → 1.57x, GEMM → 2.18x.
+- The bug triggers even within a single dispatch wave (grid = CU count) — it is not a wave-transition effect.
+
+Not a contributing factor:
 - ~~Wave quantization~~ — same grid size, same tile count
 - ~~Host dispatch overhead~~ — identical launch latency
 - ~~Communication contention~~ — comm-only benchmarks show < 1% CU masking impact
@@ -235,7 +235,83 @@ DMA takes a bigger hit from chunking (256 small `hipMemcpyAsync` calls accumulat
 
 ---
 
-## 7. GEMM Kernel Resource Analysis
+## 7. Compute Intensity vs CU Masking Slowdown
+
+Tests whether the WG dispatch counter bug can be triggered in non-GEMM kernels by adding ALU work. Uses a persistent copy kernel (`BLOCK_SIZE=8192`, `num_warps=8`) with a configurable FMA loop after each load: `for _ in range(COMPUTE_ITERS): acc = acc * 0.999 + data * 0.001`. Single GPU, CU-masked stream at 0.3 (91 CUs).
+
+### Varying compute intensity (grid=304 WGs, 32 MB × 16 iters)
+
+| Kernel Type          | COMPUTE_ITERS | Regular (ms) | Masked (ms) | Slowdown  |
+|:--|:-:|:-:|:-:|:-:|
+| BW-only (load/store) | 0             | 0.47         | 0.47        | **1.00x** |
+| Light compute        | 64            | 0.55         | 0.72        | **1.28x** |
+| Medium compute       | 256           | 1.51         | 2.22        | **1.47x** |
+| Heavy compute        | 1024          | 5.21         | 8.23        | **1.57x** |
+| GEMM (Section 4)     | —             | 6.11         | 13.31       | **2.18x** |
+
+### Findings
+
+1. **The WG dispatch bug is proportional to compute density.** Pure BW-limited kernels show zero impact (1.00x) even at 53.9 waves. Adding 64 FMAs/element triggers 1.28x; 1024 FMAs gives 1.57x; GEMM (extreme ALU density) hits 2.18x.
+
+2. **Grid size (wave count) does not affect the slowdown.** The ratio stays constant from 1 wave to 8 waves. The bug triggers even within a single dispatch wave — it is not solely a wave-transition problem. This suggests the dispatch counter mismatch causes stalls within the initial WG scheduling phase itself.
+
+3. **Bandwidth-limited kernels are immune** because WGs spend most time waiting on memory. Dispatch stalls are hidden under memory latency and don't extend the critical path.
+
+4. **The dispatch bug is kernel-agnostic** — it is not specific to GEMM. Any compute-bound kernel dispatched on a CU-masked stream will experience a slowdown proportional to its ALU intensity.
+
+### Grid-Matched Experiment: grid=213, CU mask=213 (Apples to Apples)
+
+**File:** `tutorials/test_grid_matched_intensity.py`
+
+The experiments above used CU mask = 91 CUs (comm CUs from 0.3 ratio), with grid=213 exceeding the mask. This subsection uses CU mask = **213 compute CUs** from the same 0.3 ratio, so grid = mask exactly. Both regular and CU-masked streams launch 213 WGs — the only difference is `hipExtStreamCreateWithCUMask`. This is the definitive apples-to-apples test.
+
+**Setup:** grid=213, CU mask=213 compute CUs (interleaved, 32 MB × 16 iters, single GPU, 3 runs averaged
+
+| Kernel Type          | COMPUTE_ITERS | Regular (ms) | Masked (ms) | Slowdown  |
+|:--|:-:|:-:|:-:|:-:|
+| BW-only (load/store) | 0             | 0.73         | 0.70        | **0.97x** |
+| Light compute        | 64            | 0.71         | 1.16        | **1.62x** |
+| Medium compute       | 256           | 1.85         | 3.76        | **2.03x** |
+| Heavy compute        | 1024          | 6.65         | 14.25       | **2.15x** |
+| GEMM (Section 3)     | —             | 6.07         | 13.44       | **2.21x** |
+
+**Key finding:** This is a single-GPU, single-stream test with no communication. The only difference between "Regular" and "Masked" is whether `hipExtStreamCreateWithCUMask` is used — both launch exactly 213 WGs. On the regular stream, the GPU scheduler distributes 213 WGs across all 304 CUs. On the masked stream, 213 WGs are restricted to 213 specific CUs (interleaved compute CUs from 0.3 ratio). If CU masking worked correctly, these should be **identical** since 213 WGs fit perfectly on 213 CUs.
+
+Instead, the dispatch bug causes **2.15x slowdown** for compute-bound kernels even with a perfect grid-to-CU match. This proves:
+
+1. **The bug triggers regardless of grid vs mask relationship.** Even with grid = mask (213 WGs on 213 CUs), the interleaved CU mask pattern leaves masked-but-physical CU slots within each Shader Engine. The round-robin dispatcher visits all SE slots and stalls when it hits a masked-but-physical CU where no dummy WG is scheduled.
+
+2. **BW-limited kernels remain immune** — dispatch stalls are fully hidden under memory latency.
+
+3. **This is the definitive apples-to-apples evidence** that `hipExtStreamCreateWithCUMask` is broken for compute-bound kernels on MI300X. Same grid size, same kernel, same data — only the stream type differs.
+
+### Varying mask size: Slowdown vs number of masked CUs (Heavy compute, 1024 FMA)
+
+**File:** `tutorials/test_grid_matched_intensity.py`
+
+Sweeps different CU mask sizes and grid configurations to understand how many masked-out CUs affect the dispatch bug severity. All use the same persistent copy kernel with `BLOCK_SIZE=8192`, `num_warps=8`, 32 MB × 16 iters, single GPU.
+
+| Config                         | BW-only | Light (64 FMA) | Medium (256 FMA) | Heavy (1024 FMA) |
+|:--|:-:|:-:|:-:|:-:|
+| grid=304, mask=91 CUs (30%)   | 0.96x   | 1.10x          | 1.50x            | 1.61x            |
+| grid=304, mask=213 CUs (70%)  | 0.97x   | 1.39x          | 2.07x            | 2.17x            |
+| grid=304, mask=270 CUs (89%)  | 0.97x   | 1.34x          | 1.46x            | 1.58x            |
+| grid=213, mask=213 CUs (70%)  | 0.99x   | 1.60x          | 2.04x            | 2.14x            |
+| grid=270, mask=270 CUs (89%)  | 0.98x   | 1.17x          | 1.57x            | 1.64x            |
+
+**Key findings:**
+
+1. **Slowdown is not monotonic with mask size.** Mask=213 (70%, 91 CUs excluded) produces the worst slowdown (~2.17x), worse than both mask=91 (30%, 213 CUs excluded, ~1.61x) and mask=270 (89%, 34 CUs excluded, ~1.58x).
+
+2. **Mask=270 (excluding only 34 CUs) still causes 1.58x slowdown.** Even masking out just 11% of CUs triggers a significant dispatch bug for compute-bound kernels.
+
+3. **Grid-matched vs grid-oversubscribed barely matters.** grid=304/mask=270 (1.58x) vs grid=270/mask=270 (1.64x) are within noise. Similarly grid=304/mask=213 (2.17x) vs grid=213/mask=213 (2.14x). The dispatch bug severity is driven by the **mask pattern**, not grid-to-mask ratio.
+
+4. **The worst case is the interleaved 213-CU mask** — likely because interleaving 91 "holes" across all 8 XCDs × 4 SEs creates the maximum number of masked-but-physical CU slots for the round-robin dispatcher to stall on.
+
+---
+
+## 8. GEMM Kernel Resource Analysis
 
 From rocprofv3 trace data and kernel configuration:
 
@@ -273,7 +349,7 @@ From rocprofv3 trace data and kernel configuration:
 
 ---
 
-## 8. Experiment B: Work-Stealing GEMM + Communication Overlap (Tutorial 13)
+## 9. Experiment B: Work-Stealing GEMM + Communication Overlap (Tutorial 13)
 
 Implements work-stealing persistent GEMM using per-XCD atomic tile counters. Runs GEMM at various CU counts with concurrent Triton copy kernel on a separate stream (no CU masking — just grid size control).
 
@@ -307,7 +383,7 @@ Implements work-stealing persistent GEMM using per-XCD atomic tile counters. Run
 
 ---
 
-## 9. Earlier Results (Tutorials 11, 09)
+## 10. Earlier Results (Tutorials 11, 09)
 
 ### Tutorial 11: CU Masking Overlap (Synthetic Kernels)
 
@@ -321,7 +397,7 @@ Implements work-stealing persistent GEMM using per-XCD atomic tile counters. Run
 Two unmasked streams achieve ~93% overlap naturally. CU masking always adds overhead.
 
 
-## 10. Conclusions
+## 11. Conclusions
 
 | Approach                                        | Does it help overlap?                | Why / Why not                                                                    |
 |:--|:--|:--|
@@ -348,17 +424,18 @@ Two unmasked streams achieve ~93% overlap naturally. CU masking always adds over
 
 ---
 
-## 11. Files Created
+## 12. Files Created
 
 | File                                   | Description                                                                                |
 |:--|:--|
 | `tutorials/12-cu-masked-ag-gemm.py`    | AG+GEMM with CU masking (bug fixed: cu_copy_kernel now uses ag_stream)                     |
 | `tutorials/15-comm-only-benchmark.py`  | Comm-only p2p benchmark: DMA vs CU-kernel, contiguous vs chunked, with/without CU masking  |
 | `tutorials/16-gemm-only-cu-mask.py`    | Standalone GEMM-only CU mask benchmark — no communication, single GPU                      |
+| `tutorials/test_grid_matched_intensity.py` | Grid-matched compute intensity sweep: grid=213, mask=213 (apples-to-apples CU masking test) |
 
 ---
 
-## 12. Git Log
+## 13. Git Log
 
 ```
 677aea3 Experiment B: work-stealing GEMM shows better overlap tolerance

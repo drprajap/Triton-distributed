@@ -73,6 +73,36 @@ def persistent_copy_kernel(
         tl.store(dst_ptr + offsets, data, mask=mask)
 
 
+@triton.jit
+def heavy_copy_kernel(
+    src_ptr, dst_ptr, n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_WGS: tl.constexpr,
+):
+    """Persistent copy kernel with large BLOCK_SIZE and num_warps to inflate
+    register pressure and force ~1 WG/CU occupancy.  This lets us confirm
+    that the WG dispatch counter bug triggers for *any* kernel, not just GEMM,
+    when CU masking is applied."""
+    pid = tl.program_id(0)
+    n_blocks = tl.cdiv(n_elements, BLOCK_SIZE)
+    for block_id in range(pid, n_blocks, NUM_WGS):
+        offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        data = tl.load(src_ptr + offsets, mask=mask)
+        tl.store(dst_ptr + offsets, data, mask=mask)
+
+
+def do_heavy_cu_copy(src_flat, dst_flat, n_elements, stream, n_iters, num_wgs):
+    BLOCK_SIZE = 8192
+    with torch.cuda.stream(stream):
+        for _ in range(n_iters):
+            heavy_copy_kernel[(num_wgs,)](
+                src_flat, dst_flat, n_elements,
+                BLOCK_SIZE=BLOCK_SIZE, NUM_WGS=num_wgs,
+                num_warps=8, num_stages=1,
+            )
+
+
 def time_fn(fn, warmup, repeats):
     for _ in range(warmup):
         fn()
@@ -197,6 +227,8 @@ def run_benchmark(rank, num_ranks, workspace_tensors, size_mb,
     masked_stream_01 = CUMaskedStreamWrapper(create_stream_with_cu_mask(mask_01))
 
     grid_70pct = int(total_cus * 0.7)  # 213
+    grid_03 = len(cus_03)  # 91 — matches CU-masked 0.3 exactly
+    grid_01 = len(cus_01)  # 30 — matches CU-masked 0.1 exactly
     total_mb = size_mb * copy_iters
     full_grid_wgs = triton.cdiv(n_elements, 1024)
 
@@ -278,6 +310,42 @@ def run_benchmark(rank, num_ranks, workspace_tensors, size_mb,
         (f"CU-k | CU-masked 0.1, grid 70%",
          lambda g=grid_70pct: do_cu_copy(src_flat, dst_flat, n_elements,
                                          masked_stream_01, copy_iters, max_grid=g)),
+
+        # --- CU-kernel grid=CU mask count (persistent, fair comparison) ---
+        (f"CU-k | regular, grid={grid_03} (0.3 CUs)",
+         lambda g=grid_03: do_cu_copy(src_flat, dst_flat, n_elements,
+                                       regular_stream, copy_iters, max_grid=g)),
+        (f"CU-k | CU-masked 0.3, grid={grid_03}",
+         lambda g=grid_03: do_cu_copy(src_flat, dst_flat, n_elements,
+                                       masked_stream_03, copy_iters, max_grid=g)),
+        (f"CU-k | regular, grid={grid_01} (0.1 CUs)",
+         lambda g=grid_01: do_cu_copy(src_flat, dst_flat, n_elements,
+                                       regular_stream, copy_iters, max_grid=g)),
+        (f"CU-k | CU-masked 0.1, grid={grid_01}",
+         lambda g=grid_01: do_cu_copy(src_flat, dst_flat, n_elements,
+                                       masked_stream_01, copy_iters, max_grid=g)),
+
+        # --- Heavy CU-kernel (high register pressure, ~1 WG/CU) ---
+        # BLOCK_SIZE=8192, num_warps=8 → inflated register usage to trigger
+        # WG dispatch counter bug with CU masking
+        (f"HEAVY| regular, grid={total_cus} WGs",
+         lambda g=total_cus: do_heavy_cu_copy(src_flat, dst_flat, n_elements,
+                                              regular_stream, copy_iters, num_wgs=g)),
+        (f"HEAVY| CU-masked 0.3, grid={total_cus} WGs",
+         lambda g=total_cus: do_heavy_cu_copy(src_flat, dst_flat, n_elements,
+                                              masked_stream_03, copy_iters, num_wgs=g)),
+        (f"HEAVY| CU-masked 0.1, grid={total_cus} WGs",
+         lambda g=total_cus: do_heavy_cu_copy(src_flat, dst_flat, n_elements,
+                                              masked_stream_01, copy_iters, num_wgs=g)),
+        (f"HEAVY| regular, grid={grid_70pct} WGs",
+         lambda g=grid_70pct: do_heavy_cu_copy(src_flat, dst_flat, n_elements,
+                                               regular_stream, copy_iters, num_wgs=g)),
+        (f"HEAVY| CU-masked 0.3, grid={grid_70pct} WGs",
+         lambda g=grid_70pct: do_heavy_cu_copy(src_flat, dst_flat, n_elements,
+                                               masked_stream_03, copy_iters, num_wgs=g)),
+        (f"HEAVY| CU-masked 0.1, grid={grid_70pct} WGs",
+         lambda g=grid_70pct: do_heavy_cu_copy(src_flat, dst_flat, n_elements,
+                                               masked_stream_01, copy_iters, num_wgs=g)),
     ]
 
     if rank == 0:
