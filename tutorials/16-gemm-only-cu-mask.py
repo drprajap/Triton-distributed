@@ -234,4 +234,11 @@ def main():
 
 
 if __name__ == "__main__":
+    import os
+
+    if os.environ.get("CU_MASK_SUITE_CALLER") != "1":
+        print(
+            "[DEPRECATED] Direct execution is deprecated. "
+            "Use tutorials/cu_mask_suite.py compute-only ... or scripts/cu_experiments.py."
+        )
     main()

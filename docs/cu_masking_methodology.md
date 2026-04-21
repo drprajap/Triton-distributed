@@ -18,6 +18,14 @@ Stage-1 includes:
 2. Comm-only characterization (`tutorials/15-comm-only-benchmark.py`)
 3. AG+GEMM characterization (`tutorials/12-cu-masked-ag-gemm.py`)
 4. Grid-matched intensity sweep (`tutorials/test_grid_matched_intensity.py`)
+5. Unified implementation entrypoint (`tutorials/cu_mask_suite.py`)
+
+Canonical implementation path:
+
+- `scripts/cu_experiments.py` -> `tutorials/cu_mask_suite.py` -> scenario backend
+
+Legacy tutorial scripts are now compatibility backends and are deprecated for
+direct day-to-day benchmark execution.
 
 Stage-2 backlog (deferred):
 
