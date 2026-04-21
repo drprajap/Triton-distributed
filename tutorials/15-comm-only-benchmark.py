@@ -20,6 +20,7 @@ import argparse
 import importlib.util
 import statistics
 import time
+import gc
 from pathlib import Path
 
 import torch
@@ -348,35 +349,38 @@ def run_benchmark(rank, num_ranks, workspace_tensors, size_mb,
                                                masked_stream_01, copy_iters, num_wgs=g)),
     ]
 
-    if rank == 0:
-        chunk_desc = f", chunked={n_chunks}x{chunk_size_kb}KB" if chunk_size_kb else ""
-        print(f"\n{'='*90}")
-        print(f" {size_mb} MB x {copy_iters} iters = {total_mb} MB total p2p via XGMI{chunk_desc}")
-        print(f"{'='*90}")
-        print(f"{'Mode':<45s} {'Median':>9s} {'Mean':>9s} {'Std':>7s} {'BW':>9s}")
-        print(f"{'':45s} {'(ms)':>9s} {'(ms)':>9s} {'(ms)':>7s} {'(GB/s)':>9s}")
-        print(f"{'-'*90}")
-
-    results = {}
-    for label, fn in modes:
-        times = time_fn(fn, warmup, repeats)
-        med = statistics.median(times)
-        mn = statistics.mean(times)
-        sd = statistics.pstdev(times)
-        bw = (total_mb / 1024) / (med / 1000)
+    try:
         if rank == 0:
-            print(f"  {label:<43s} {med:>9.3f} {mn:>9.3f} {sd:>7.3f} {bw:>9.1f}")
-        results[label] = med
+            chunk_desc = f", chunked={n_chunks}x{chunk_size_kb}KB" if chunk_size_kb else ""
+            print(f"\n{'='*90}")
+            print(f" {size_mb} MB x {copy_iters} iters = {total_mb} MB total p2p via XGMI{chunk_desc}")
+            print(f"{'='*90}")
+            print(f"{'Mode':<45s} {'Median':>9s} {'Mean':>9s} {'Std':>7s} {'BW':>9s}")
+            print(f"{'':45s} {'(ms)':>9s} {'(ms)':>9s} {'(ms)':>7s} {'(GB/s)':>9s}")
+            print(f"{'-'*90}")
 
-    if rank == 0:
-        baseline = list(results.values())[0]
-        print(f"\n  Speedups (vs DMA regular):")
-        for label, med in results.items():
-            print(f"    {label:<43s}: {baseline / med:.3f}x")
+        results = {}
+        for label, fn in modes:
+            times = time_fn(fn, warmup, repeats)
+            med = statistics.median(times)
+            mn = statistics.mean(times)
+            sd = statistics.pstdev(times)
+            bw = (total_mb / 1024) / (med / 1000)
+            if rank == 0:
+                print(f"  {label:<43s} {med:>9.3f} {mn:>9.3f} {sd:>7.3f} {bw:>9.1f}")
+            results[label] = med
 
-    masked_stream_03.destroy()
-    masked_stream_01.destroy()
-    return results
+        if rank == 0:
+            baseline = list(results.values())[0]
+            print(f"\n  Speedups (vs DMA regular):")
+            for label, med in results.items():
+                print(f"    {label:<43s}: {baseline / med:.3f}x")
+
+        return results
+    finally:
+        # Always tear down masked streams even if one mode errors.
+        masked_stream_03.destroy()
+        masked_stream_01.destroy()
 
 
 def main():
@@ -436,6 +440,10 @@ def main():
     if rank == 0:
         print("\nDone.")
 
+    # Release rocSHMEM-backed tensors before finalize to avoid freeing
+    # symmetric heap allocations during Python object teardown after finalize.
+    del workspace_tensors
+    gc.collect()
     torch.cuda.synchronize()
     torch.distributed.barrier()
     pyrocshmem.rocshmem_finalize()

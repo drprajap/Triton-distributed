@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "suite_name": "cu_mask_stage1",
+  "fixed_methodology": {
+    "notes": [
+      "Single canonical runner for stage-1 CU masking experiments",
+      "Software masking and persistent occupancy are deferred to stage-2",
+      "All scenario runs must emit kernel/grid/mask/engine metadata"
+    ],
+    "defaults": {
+      "warmup": 3,
+      "repeats": 7,
+      "dtype": "float16",
+      "grid_policy": "fixed",
+      "message_size_mb": 32,
+      "chunk_size_kb": 2048
+    },
+    "env_snapshot_commands": [
+      "date",
+      "python --version",
+      "python -c \"import torch; print('torch', torch.__version__)\"",
+      "python -c \"import triton; print('triton', triton.__version__)\"",
+      "rocm-smi --showproductname --showdriverversion --showvbios",
+      "rocm-smi --showclocks"
+    ]
+  },
+  "experiments": [
+    {
+      "id": "ag_gemm_copy_engine_fixed",
+      "scenario": "ag-gemm",
+      "description": "AG+GEMM DMA communication with fixed grid",
+      "script": "tutorials/12-cu-masked-ag-gemm.py",
+      "distributed": true,
+      "args": [
+        "--M", "8192",
+        "--N", "11008",
+        "--K", "4096",
+        "--chunk-size", "256",
+        "--warmup", "3",
+        "--repeats", "7",
+        "--num-sms", "304",
+        "--gemm-iters", "8",
+        "--comm-engine", "copy-engine",
+        "--comm-ratio", "0.3",
+        "--modes", "unmasked,cu-masked"
+      ],
+      "metadata": {
+        "grid_size": 304,
+        "mask_policy": "comm_ratio_0.3",
+        "message_pattern": "chunked",
+        "comm_engine": "copy-engine"
+      }
+    },
+    {
+      "id": "ag_gemm_cukernel_fixed",
+      "scenario": "ag-gemm",
+      "description": "AG+GEMM CU-kernel communication with fixed grid",
+      "script": "tutorials/12-cu-masked-ag-gemm.py",
+      "distributed": true,
+      "args": [
+        "--M", "8192",
+        "--N", "11008",
+        "--K", "4096",
+        "--chunk-size", "256",
+        "--warmup", "3",
+        "--repeats", "7",
+        "--num-sms", "304",
+        "--gemm-iters", "8",
+        "--comm-engine", "cu-kernel",
+        "--comm-ratio", "0.3",
+        "--modes", "unmasked,cu-masked"
+      ],
+      "metadata": {
+        "grid_size": 304,
+        "mask_policy": "comm_ratio_0.3",
+        "message_pattern": "chunked",
+        "comm_engine": "cu-kernel"
+      }
+    },
+    {
+      "id": "ag_gemm_cukernel_grid_compare",
+      "scenario": "ag-gemm",
+      "description": "AG+GEMM CU-kernel fixed-vs-reduced grid without mode drift",
+      "script": "tutorials/12-cu-masked-ag-gemm.py",
+      "distributed": true,
+      "args": [
+        "--M", "8192",
+        "--N", "11008",
+        "--K", "4096",
+        "--chunk-size", "256",
+        "--warmup", "3",
+        "--repeats", "7",
+        "--num-sms", "213",
+        "--gemm-iters", "8",
+        "--comm-engine", "cu-kernel",
+        "--comm-ratio", "0.3",
+        "--modes", "unmasked,cu-masked"
+      ],
+      "metadata": {
+        "grid_size": 213,
+        "mask_policy": "comm_ratio_0.3",
+        "message_pattern": "chunked",
+        "comm_engine": "cu-kernel"
+      }
+    },
+    {
+      "id": "comm_only_contiguous",
+      "scenario": "comm-only",
+      "description": "Communication-only contiguous transfer matrix",
+      "script": "tutorials/15-comm-only-benchmark.py",
+      "distributed": true,
+      "args": [
+        "--size-mb", "32",
+        "--copy-iters", "16",
+        "--warmup", "5",
+        "--repeats", "7"
+      ],
+      "metadata": {
+        "message_pattern": "contiguous"
+      }
+    },
+    {
+      "id": "comm_only_chunked",
+      "scenario": "comm-only",
+      "description": "Communication-only chunked transfer matrix",
+      "script": "tutorials/15-comm-only-benchmark.py",
+      "distributed": true,
+      "args": [
+        "--size-mb", "32",
+        "--copy-iters", "16",
+        "--warmup", "5",
+        "--repeats", "7",
+        "--chunk-size-kb", "2048"
+      ],
+      "metadata": {
+        "message_pattern": "chunked"
+      }
+    },
+    {
+      "id": "compute_only_gemm",
+      "scenario": "compute-only",
+      "description": "GEMM-only masking characterization",
+      "script": "tutorials/16-gemm-only-cu-mask.py",
+      "distributed": false,
+      "args": [
+        "--M", "8192",
+        "--N", "5504",
+        "--K", "4096",
+        "--num-sms", "213",
+        "--gemm-iters", "8",
+        "--warmup", "3",
+        "--repeats", "7",
+        "--comm-ratio", "0.3"
+      ],
+      "metadata": {
+        "grid_size": 213,
+        "mask_policy": "compute_cus_from_ratio_0.3"
+      }
+    },
+    {
+      "id": "intensity_grid_matched",
+      "scenario": "intensity-sweep",
+      "description": "Grid-matched compute intensity sweep",
+      "script": "tutorials/test_grid_matched_intensity.py",
+      "distributed": false,
+      "args": [
+        "--grid", "213",
+        "--mask-cus", "213",
+        "--size-mb", "32",
+        "--iters", "16"
+      ],
+      "metadata": {
+        "grid_size": 213,
+        "mask_size": 213
+      }
+    }
+  ]
+}
