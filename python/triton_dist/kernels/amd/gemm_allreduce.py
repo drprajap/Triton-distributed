@@ -22,6 +22,7 @@
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 ################################################################################
+import os
 import torch
 import dataclasses
 from typing import List
@@ -36,7 +37,7 @@ from triton_dist.language.extra.language_extra import st
 from triton_dist.utils import HIP_CHECK
 
 from triton.runtime.driver import driver
-from triton_dist.kernels.amd.common_ops import barrier_all_ipc_kernel
+from triton_dist.kernels.amd.common_ops import barrier_all_ipc_kernel, barrier_all_ipc_kernel_v2
 
 
 @dataclasses.dataclass
@@ -50,6 +51,12 @@ class GemmARContext:
     tile_completed_buf: torch.Tensor
     dma_staging_buf: torch.Tensor
     ar_stream: torch.cuda.Stream
+    # Optional second symmetric buffer (the reduce-scatter scratch `z`) used
+    # only by the two-shot all-reduce path. Allocated lazily via
+    # create_gemm_ar_context(..., alloc_scratch=True) so the one-shot / dma /
+    # fused paths keep their original (single symmetric buffer) heap footprint.
+    symm_scratch_buf: torch.Tensor = None
+    symm_scratch_buf_list: List[torch.Tensor] = None
 
     def get_gemm_out_buf(self, A: torch.Tensor, B: torch.Tensor):
         M, N = A.shape[0], B.shape[0]
@@ -70,7 +77,7 @@ class GemmARContext:
 
 ## TODO: get rid of rocshmem_create_tensor_list_intra_node
 def create_gemm_ar_context(ar_stream: torch.cuda.Stream, rank, world_size, max_M, N, dtype, MIN_BLOCK_SIZE_M=64,
-                           MIN_BLOCK_SIZE_N=64):
+                           MIN_BLOCK_SIZE_N=64, alloc_scratch=False):
     comm_bufs = pyrocshmem.rocshmem_create_tensor_list_intra_node([world_size], torch.int32)
     comm_buf_ptr = torch.tensor([t.data_ptr() for t in comm_bufs], device=torch.cuda.current_device(),
                                 requires_grad=False)
@@ -82,11 +89,19 @@ def create_gemm_ar_context(ar_stream: torch.cuda.Stream, rank, world_size, max_M
     gemm_out_buf = gemm_out_bufs[rank]
     tile_completed_buf = tile_signal_bufs[rank]
     dma_staging_buf = torch.empty((max_M, N), dtype=dtype, device=torch.cuda.current_device())
+    # Two-shot needs a second *symmetric* buffer (the reduce-scatter scratch
+    # `z`), doubling the symmetric heap footprint, so only allocate on request.
+    scratch_buf = None
+    scratch_bufs = None
+    if alloc_scratch:
+        scratch_bufs = pyrocshmem.rocshmem_create_tensor_list_intra_node([max_M, N], dtype)
+        scratch_buf = scratch_bufs[rank]
     torch.cuda.synchronize()
     torch.distributed.barrier()
     return GemmARContext(rank=rank, num_ranks=world_size, comm_bufs=comm_bufs, comm_buf_ptr=comm_buf_ptr,
                          symm_gemm_out_buf=gemm_out_buf, symm_gemm_out_buf_list=gemm_out_bufs,
-                         tile_completed_buf=tile_completed_buf, dma_staging_buf=dma_staging_buf, ar_stream=ar_stream)
+                         tile_completed_buf=tile_completed_buf, dma_staging_buf=dma_staging_buf, ar_stream=ar_stream,
+                         symm_scratch_buf=scratch_buf, symm_scratch_buf_list=scratch_bufs)
 
 
 @triton.jit(do_not_specialize=["rank"])
@@ -446,6 +461,28 @@ def _barrier_all(ctx: GemmARContext, num_sms: int):
         ctx.tile_completed_buf.shape[0], num_warps=16)
 
 
+def _barrier_all_v2(ctx: GemmARContext):
+    """Trick B (W21): parallel-thread atomic-CAS team barrier as a 1-CTA launch.
+
+    Equivalent semantically to ``_barrier_all`` (and to
+    ``rocshmem_barrier_all_on_stream``) but cheaper per call: barrier_all_ipc_kernel_v2
+    parallelizes the acquire/release handshake across ``world_size`` threads of
+    one warp instead of the serial ``for i in range(num_ranks)`` loop in
+    barrier_all_ipc_kernel. At WS=8 on MI355 this saves ~20% latency at medium
+    payloads on the pull-based one_shot path and gains ~5.7% algo BW at 128 MB
+    (see MI355_AR_W20_DeepDive_2026-05-15 §"W21 Trick B"). The trick is BW-
+    neutral at WS=2 where the rocSHMEM team barrier was already cheap, and
+    slightly worse at the smallest message floor — i.e. net positive at the
+    scale that matters.
+
+    Note: skips the tile_signal zero-out that ``_barrier_all`` does. Pure-AR
+    ops do not consume tile_signal, so this is safe; the fused GEMM+AR paths
+    must keep using ``_barrier_all`` (or zero the signal slice separately).
+    """
+    barrier_all_ipc_kernel_v2[(1, )](
+        ctx.rank, ctx.num_ranks, ctx.comm_buf_ptr, num_warps=1)
+
+
 @triton_dist.tune.autotune(
     config_space=[{"gemm_config": c} for c in get_hip_autotune_config()],
     key_fn=key_fn,
@@ -500,6 +537,47 @@ def gemm_allreduce_op_dma(ctx: GemmARContext, A: torch.Tensor, B: torch.Tensor, 
     return symm_c
 
 
+@triton_dist.tune.autotune(
+    config_space=[{"gemm_config": c} for c in get_hip_autotune_config()],
+    key_fn=key_fn,
+    prune_fn=prune_fn_by_shared_memory,
+)
+def gemm_allreduce_op_two_shot(ctx: GemmARContext, A: torch.Tensor, B: torch.Tensor, gemm_config: triton.Config):
+    """GEMM (all SMs) then the fast two-shot (reduce-scatter + push all-gather) AR.
+
+    Unlike ``gemm_allreduce_op`` -- which reserves 32 CUs for comm and overlaps a
+    per-tile *one-shot pull* all-reduce on a side stream -- this runs a plain
+    full-occupancy GEMM into the symmetric output buffer and then the standalone
+    two-shot all-reduce. The two-shot moves only ~2*numel bytes/rank (vs the
+    consumer kernel's world_size*numel pull) and, at world>=4, all-gathers in the
+    faster XGMI *write* direction (push-AG). Because the all-reduce dominates
+    latency at these GEMM shapes, dropping the overlap but using the ~2x faster
+    AR is a net win at WS>=4 (see the WS=8 GEMM+AR matrix: cu mode plateaus at
+    0.2-0.4x torch while the two-shot AR alone reaches ~0.76x).
+
+    Requires ``create_gemm_ar_context(..., alloc_scratch=True)`` for the
+    reduce-scatter scratch buffer used by ``pure_allreduce_two_shot_op``.
+    """
+    assert A.shape[1] == B.shape[1], "Incompatible dimensions"
+    assert A.dtype == B.dtype, "Incompatible dtypes"
+    assert ctx.symm_scratch_buf is not None, (
+        "gemm_allreduce_op_two_shot requires create_gemm_ar_context(..., alloc_scratch=True)")
+
+    symm_c = ctx.get_gemm_out_buf(A, B)
+    num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+    M, K = A.shape
+    N, _ = B.shape
+
+    kernel_persistent_gemm[(num_sms, )](
+        A, B, symm_c, M, N, K, A.stride(0), A.stride(1), B.stride(0), B.stride(1), symm_c.stride(0), symm_c.stride(1),
+        NUM_SMS=num_sms, **gemm_config.all_kwargs())
+
+    # Two-shot AR over the freshly produced symmetric GEMM output. The op's
+    # leading barrier publishes symm_c to peers; the self-copy of symm_c into
+    # symm_gemm_out_buf is a no-op (same storage).
+    return pure_allreduce_two_shot_op(ctx, symm_c)
+
+
 # -----------------------------------------------------------------------------
 # Pure AR ops (no fused GEMM). Used for apples-to-apples bandwidth comparison
 # against torch.distributed.all_reduce (RCCL). The DMA variant exercises the
@@ -534,6 +612,16 @@ def pure_allreduce_dma_op(ctx: GemmARContext, x: torch.Tensor) -> torch.Tensor:
     symm_flat.copy_(x.reshape(-1))
 
     num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+    # Keep the serial-loop barrier on the DMA hub-and-spoke path: the
+    # ar_stream + current_stream cross-stream wait pattern below relies on the
+    # bigger barrier kernel's launch to serialize the team handshake across
+    # all participating ranks before the per-peer hipMemcpyAsync chain
+    # starts. Swapping to barrier_all_kernel_v2 (1 CTA / 1 warp) breaks
+    # correctness at WS>=4 (verified 2026-W21: rank 0 got 13 vs ref 10),
+    # most likely because the 1-CTA barrier completes on this rank before
+    # the cross-stream wait flushes the peer's symm_flat publish. Trick B
+    # is kept on the one_shot pull path where the kernel reads peers
+    # directly from a single stream.
     _barrier_all(ctx, num_sms)
 
     current_stream = torch.cuda.current_stream()
@@ -564,7 +652,7 @@ def pure_allreduce_dma_op(ctx: GemmARContext, x: torch.Tensor) -> torch.Tensor:
 
 
 # -----------------------------------------------------------------------------
-# One-shot pure AR (Iris-style, iris.x.all_reduce_one_shot).
+# One-shot pure AR.
 # Each rank gathers partials from every peer's symmetric buffer in parallel via
 # dl.symm_at + tl.load and reduces locally. No remote stores, no atomics.
 # Parallelism is across CTAs on the XGMI mesh instead of sequential DMA hops,
@@ -601,7 +689,7 @@ def pure_allreduce_one_shot_kernel(
 
 
 def pure_allreduce_one_shot_op(ctx: GemmARContext, x: torch.Tensor) -> torch.Tensor:
-    """One-shot pure all-reduce via Triton, ported from iris.x.all_reduce_one_shot.
+    """One-shot pure all-reduce via Triton.
 
     Copies `x` into the symmetric input buffer, barriers, launches a persistent
     kernel where every rank gathers partials from all peers in parallel, then
@@ -622,7 +710,8 @@ def pure_allreduce_one_shot_op(ctx: GemmARContext, x: torch.Tensor) -> torch.Ten
     symm_in.copy_(x.reshape(-1))
 
     num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
-    _barrier_all(ctx, num_sms)
+    # W21 Trick B: parallel-thread atomic-CAS team barrier (1-CTA launch).
+    _barrier_all_v2(ctx)
 
     BLOCK_SIZE = 2048
 
@@ -635,5 +724,564 @@ def pure_allreduce_one_shot_op(ctx: GemmARContext, x: torch.Tensor) -> torch.Ten
         num_warps=4,
     )
 
-    _barrier_all(ctx, num_sms)
+    _barrier_all_v2(ctx)
     return out_buf.reshape(x.shape)
+
+
+# -----------------------------------------------------------------------------
+# Two-shot pure AR (reduce-scatter + all-gather). The one-shot kernel above
+# is a pure all-to-all read: every rank loads every peer's full payload, so
+# per-rank traffic is O(world_size * numel) and busbw plateaus at the single
+# XGMI-link cap (~80 GB/s on MI355) regardless of world size. Two-shot moves
+# ~2*numel per rank regardless of world size (bandwidth-optimal traffic):
+#
+#   1. reduce-scatter: each rank owns the contiguous chunk
+#      [rank*epb, +epb); it sums *that chunk only* across all peers' symmetric
+#      input and writes the partial into its local symmetric scratch `z`. After
+#      a barrier, `z` on rank `b` holds the fully-reduced chunk `b`.
+#   2. all-gather: each rank reads every chunk `b` from peer `b`'s `z` into its
+#      local output, materializing the full reduced array.
+#
+# This is a flat-1D specialization of the PR's 2D row-block kernels (the bench
+# harness passes 1D tensors); the chunking math is identical with epb playing
+# the role of rows_per_block * N. TD's dl.symm_at replaces the PR's
+# symmetric_ptr(x_ptr, my_pe, peer, heap_bases).
+# -----------------------------------------------------------------------------
+
+
+@triton_dist.jit
+def pure_allreduce_two_shot_rs_kernel(
+    input_ptr,  # symmetric input pointer (same symm offset on every rank)
+    scratch_ptr,  # symmetric scratch `z` (local store target)
+    numel,
+    elems_per_block,  # epb = cdiv(numel, world_size)
+    BLOCK_SIZE: tl.constexpr,
+    NUM_COMM_SMS: tl.constexpr,
+):
+    rank = dl.rank()
+    world_size = dl.num_ranks()
+    pid = tl.program_id(0)
+
+    chunk_start = rank * elems_per_block
+    chunk_end = tl.minimum(chunk_start + elems_per_block, numel)
+    num_tiles = tl.cdiv(elems_per_block, BLOCK_SIZE)
+
+    for tile_id in range(pid, num_tiles, NUM_COMM_SMS):
+        offs = chunk_start + tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offs < chunk_end
+
+        acc = tl.zeros((BLOCK_SIZE, ), dtype=tl.float32)
+        # Stagger starting peer per CTA+rank so first-hop traffic is spread
+        # across peers at finer granularity than rank-only rotation.
+        start_peer = (rank + pid) % world_size
+        for i in range(world_size):
+            peer = (start_peer + i) % world_size
+            peer_ptr = dl.symm_at(input_ptr, peer)
+            partial = tl.load(peer_ptr + offs, mask=mask, other=0.0)
+            acc += partial.to(tl.float32)
+
+        tl.store(scratch_ptr + offs, acc.to(scratch_ptr.dtype.element_ty), mask=mask)
+
+
+@triton_dist.jit
+def pure_allreduce_two_shot_ag_kernel(
+    scratch_ptr,  # symmetric scratch `z` (read from peer `b`)
+    output_ptr,  # local output pointer
+    numel,
+    elems_per_block,  # epb = cdiv(numel, world_size)
+    BLOCK_SIZE: tl.constexpr,
+    NUM_COMM_SMS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    b = tl.program_id(1)  # owner chunk index == owner rank
+
+    chunk_start = b * elems_per_block
+    chunk_end = tl.minimum(chunk_start + elems_per_block, numel)
+    num_tiles = tl.cdiv(elems_per_block, BLOCK_SIZE)
+
+    peer_z = dl.symm_at(scratch_ptr, b)
+    for tile_id in range(pid, num_tiles, NUM_COMM_SMS):
+        offs = chunk_start + tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offs < chunk_end
+        data = tl.load(peer_z + offs, mask=mask, other=0.0)
+        tl.store(output_ptr + offs, data, mask=mask)
+
+
+@triton_dist.jit
+def pure_allreduce_two_shot_rs_kernel_interleaved(
+    input_ptr,  # symmetric input pointer (same symm offset on every rank)
+    scratch_ptr,  # symmetric scratch `z` (local owner stores reduced tiles)
+    numel,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_COMM_SMS: tl.constexpr,
+):
+    # Ownership policy: rank r owns tiles where tile_id % world_size == r.
+    rank = dl.rank()
+    world_size = dl.num_ranks()
+    pid = tl.program_id(0)
+    num_tiles = tl.cdiv(numel, BLOCK_SIZE)
+    first_tile = rank + pid * world_size
+    tile_stride = NUM_COMM_SMS * world_size
+
+    for tile_id in range(first_tile, num_tiles, tile_stride):
+        offs = tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offs < numel
+        acc = tl.zeros((BLOCK_SIZE, ), dtype=tl.float32)
+        start_peer = (rank + pid) % world_size
+        for i in range(world_size):
+            peer = (start_peer + i) % world_size
+            peer_ptr = dl.symm_at(input_ptr, peer)
+            partial = tl.load(peer_ptr + offs, mask=mask, other=0.0)
+            acc += partial.to(tl.float32)
+        tl.store(scratch_ptr + offs, acc.to(scratch_ptr.dtype.element_ty), mask=mask)
+
+
+@triton_dist.jit
+def pure_allreduce_two_shot_ag_kernel_interleaved(
+    scratch_ptr,  # symmetric scratch `z` (owner rank decided by tile_id % world_size)
+    output_ptr,  # local output pointer
+    numel,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_COMM_SMS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    world_size = dl.num_ranks()
+    num_tiles = tl.cdiv(numel, BLOCK_SIZE)
+    for tile_id in range(pid, num_tiles, NUM_COMM_SMS):
+        owner = tile_id % world_size
+        offs = tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offs < numel
+        peer_z = dl.symm_at(scratch_ptr, owner)
+        data = tl.load(peer_z + offs, mask=mask, other=0.0)
+        tl.store(output_ptr + offs, data, mask=mask)
+
+
+@triton_dist.jit
+def pure_allreduce_two_shot_rs_push_kernel(
+    input_ptr,  # symmetric input
+    recv_ptr,  # symmetric recv buffer (W slots of epb); write to peer `b` slot `rank`
+    numel,
+    elems_per_block,  # epb = numel // world_size (push path requires exact division)
+    BLOCK_SIZE: tl.constexpr,
+    NUM_COMM_SMS: tl.constexpr,
+):
+    # Push reduce-scatter: rank `r` writes its chunk-`b` slice of the input into
+    # owner `b`'s recv buffer at slot `r`. After a barrier, owner `b` holds all
+    # W copies of chunk `b` and reduces them locally. Cross-fabric traffic is in
+    # the (faster) write direction.
+    rank = dl.rank()
+    pid = tl.program_id(0)
+    b = tl.program_id(1)  # owner rank of this chunk == target peer
+
+    src_start = b * elems_per_block
+    num_tiles = tl.cdiv(elems_per_block, BLOCK_SIZE)
+    peer_recv = dl.symm_at(recv_ptr, b)
+    dst_start = rank * elems_per_block  # my slot in owner b's recv buffer
+    for tile_id in range(pid, num_tiles, NUM_COMM_SMS):
+        j = tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = j < elems_per_block
+        data = tl.load(input_ptr + src_start + j, mask=mask, other=0.0)
+        tl.store(peer_recv + dst_start + j, data, mask=mask)
+
+
+@triton_dist.jit
+def pure_allreduce_two_shot_local_reduce_kernel(
+    recv_ptr,  # symmetric recv buffer: W slots of epb, all holding this rank's chunk
+    out_ptr,  # symmetric output: write reduced chunk to [rank*epb, ...)
+    numel,
+    elems_per_block,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_COMM_SMS: tl.constexpr,
+):
+    rank = dl.rank()
+    world_size = dl.num_ranks()
+    pid = tl.program_id(0)
+    num_tiles = tl.cdiv(elems_per_block, BLOCK_SIZE)
+    my_chunk = rank * elems_per_block
+    for tile_id in range(pid, num_tiles, NUM_COMM_SMS):
+        j = tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = j < elems_per_block
+        acc = tl.zeros((BLOCK_SIZE, ), dtype=tl.float32)
+        for s in range(world_size):
+            acc += tl.load(recv_ptr + s * elems_per_block + j, mask=mask, other=0.0).to(tl.float32)
+        tl.store(out_ptr + my_chunk + j, acc.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+@triton_dist.jit(do_not_specialize=["send_chunk"])
+def ring_rs_send_kernel(
+    wbuf_ptr,  # symmetric working buffer (W chunks of epb); send chunk `send_chunk`
+    recv_ptr,  # symmetric recv buffer (epb); write into next rank's recv
+    elems_per_block,  # epb
+    send_chunk,  # which chunk this rank forwards this step
+    BLOCK_SIZE: tl.constexpr,
+    NUM_COMM_SMS: tl.constexpr,
+):
+    # Ring reduce-scatter, push step: rank r writes its current partial for
+    # `send_chunk` into the *next* rank's recv buffer (XGMI write direction).
+    rank = dl.rank()
+    world_size = dl.num_ranks()
+    pid = tl.program_id(0)
+    nxt = (rank + 1) % world_size
+    peer_recv = dl.symm_at(recv_ptr, nxt)
+    src_start = send_chunk * elems_per_block
+    num_tiles = tl.cdiv(elems_per_block, BLOCK_SIZE)
+    for tile_id in range(pid, num_tiles, NUM_COMM_SMS):
+        j = tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = j < elems_per_block
+        data = tl.load(wbuf_ptr + src_start + j, mask=mask, other=0.0)
+        tl.store(peer_recv + j, data, mask=mask)
+
+
+@triton_dist.jit(do_not_specialize=["recv_chunk"])
+def ring_rs_add_kernel(
+    wbuf_ptr,  # symmetric working buffer; accumulate into chunk `recv_chunk`
+    recv_ptr,  # local recv buffer holding neighbour's partial (epb)
+    elems_per_block,  # epb
+    recv_chunk,  # which chunk this rank reduces this step
+    BLOCK_SIZE: tl.constexpr,
+    NUM_COMM_SMS: tl.constexpr,
+):
+    # Local add (HBM): wbuf[recv_chunk] += recv. Both reads + the write are local.
+    pid = tl.program_id(0)
+    dst_start = recv_chunk * elems_per_block
+    num_tiles = tl.cdiv(elems_per_block, BLOCK_SIZE)
+    for tile_id in range(pid, num_tiles, NUM_COMM_SMS):
+        j = tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = j < elems_per_block
+        cur = tl.load(wbuf_ptr + dst_start + j, mask=mask, other=0.0).to(tl.float32)
+        inc = tl.load(recv_ptr + j, mask=mask, other=0.0).to(tl.float32)
+        tl.store(wbuf_ptr + dst_start + j, (cur + inc).to(wbuf_ptr.dtype.element_ty), mask=mask)
+
+
+@triton_dist.jit
+def pure_allreduce_two_shot_ag_push_kernel(
+    scratch_ptr,  # symmetric scratch `z`: this rank owns chunk `rank` (local read)
+    symm_out_ptr,  # symmetric output target (written on self + every peer)
+    numel,
+    elems_per_block,  # epb = cdiv(numel, world_size)
+    BLOCK_SIZE: tl.constexpr,
+    NUM_COMM_SMS: tl.constexpr,
+):
+    # Push all-gather: each rank owns
+    # reduced chunk `rank` and *writes* it into every peer's output via the XGMI
+    # write direction, which saturates the fabric better than dependent remote
+    # loads at large world size. Persistent 1D grid; each tile is loaded once
+    # and stored to self + every peer.
+    rank = dl.rank()
+    world_size = dl.num_ranks()
+    pid = tl.program_id(0)
+
+    chunk_start = rank * elems_per_block
+    chunk_end = tl.minimum(chunk_start + elems_per_block, numel)
+    num_tiles = tl.cdiv(elems_per_block, BLOCK_SIZE)
+
+    for tile_id in range(pid, num_tiles, NUM_COMM_SMS):
+        offs = chunk_start + tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offs < chunk_end
+        data = tl.load(scratch_ptr + offs, mask=mask, other=0.0)
+        # Self block (local store).
+        tl.store(symm_out_ptr + offs, data, mask=mask)
+        # Push the tile to every peer, rotating the start by `pid` for traffic
+        # shaping. Rotate within the (world_size-1) non-self peers (mod W-1): the
+        # naive (rank+1+pid+i)%W form would skip a real peer and break the AG.
+        for i in range(world_size - 1):
+            peer = (rank + 1 + (pid + i) % (world_size - 1)) % world_size
+            peer_out = dl.symm_at(symm_out_ptr, peer)
+            tl.store(peer_out + offs, data, mask=mask)
+
+
+@triton_dist.jit
+def pure_allreduce_two_shot_fused_kernel(
+    symm_in_ptr,  # symmetric input (this rank's partial); chunk `rank` read from all peers
+    symm_out_ptr,  # symmetric output (reduced chunk written self + pushed to peers)
+    numel,
+    elems_per_block,  # epb = cdiv(numel, world_size)
+    BLOCK_SIZE: tl.constexpr,
+    NUM_COMM_SMS: tl.constexpr,
+):
+    # Fused reduce-scatter + push all-gather (barrier-fusion, Lever A).
+    #
+    # Rank `r` owns chunk `r`. For each tile of its chunk it (1) pull-reduces
+    # that tile across all peers' inputs *in registers*, then (2) immediately
+    # writes the reduced tile to its own output and pushes it to every peer's
+    # output. Because we read `symm_in` but write a *separate* symmetric
+    # `symm_out`, there is no RS<->AG write-after-read hazard on the input, so
+    # the mid barrier between the two phases AND the HBM scratch round-trip
+    # (write reduced chunk to `z`, then reload it in the AG kernel) are both
+    # removed. Net: 1 kernel + 2 barriers, vs 2 kernels + 3 barriers. Same XGMI
+    # traffic as the split two-shot (2*(W-1)/W*numel).
+    rank = dl.rank()
+    world_size = dl.num_ranks()
+    pid = tl.program_id(0)
+
+    chunk_start = rank * elems_per_block
+    chunk_end = tl.minimum(chunk_start + elems_per_block, numel)
+    num_tiles = tl.cdiv(elems_per_block, BLOCK_SIZE)
+
+    for tile_id in range(pid, num_tiles, NUM_COMM_SMS):
+        offs = chunk_start + tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offs < chunk_end
+        # (1) pull-reduce this tile across all peers (rotate start per CTA+rank).
+        acc = tl.zeros((BLOCK_SIZE, ), dtype=tl.float32)
+        start_peer = (rank + pid) % world_size
+        for i in range(world_size):
+            peer = (start_peer + i) % world_size
+            peer_in = dl.symm_at(symm_in_ptr, peer)
+            partial = tl.load(peer_in + offs, mask=mask, other=0.0)
+            acc += partial.to(tl.float32)
+        data = acc.to(symm_out_ptr.dtype.element_ty)
+        # (2) write reduced tile locally, then push to every peer's output
+        # (rotate within the W-1 non-self peers, same as the push-AG kernel).
+        tl.store(symm_out_ptr + offs, data, mask=mask)
+        for i in range(world_size - 1):
+            peer = (rank + 1 + (pid + i) % (world_size - 1)) % world_size
+            peer_out = dl.symm_at(symm_out_ptr, peer)
+            tl.store(peer_out + offs, data, mask=mask)
+
+
+@triton_dist.jit
+def pure_allreduce_two_shot_ag_push_kernel_interleaved(
+    scratch_ptr,  # symmetric scratch `z`: owner rank determined by tile_id % world_size
+    symm_out_ptr,  # symmetric output target (written on self + every peer)
+    numel,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_COMM_SMS: tl.constexpr,
+):
+    rank = dl.rank()
+    world_size = dl.num_ranks()
+    pid = tl.program_id(0)
+    num_tiles = tl.cdiv(numel, BLOCK_SIZE)
+    first_tile = rank + pid * world_size
+    tile_stride = NUM_COMM_SMS * world_size
+    for tile_id in range(first_tile, num_tiles, tile_stride):
+        offs = tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offs < numel
+        data = tl.load(scratch_ptr + offs, mask=mask, other=0.0)
+        tl.store(symm_out_ptr + offs, data, mask=mask)
+        # Rotate only across non-self peers; this preserves traffic shaping while
+        # guaranteeing each remote peer gets the tile exactly once.
+        for i in range(world_size - 1):
+            peer = (rank + 1 + (pid + i) % (world_size - 1)) % world_size
+            peer_out = dl.symm_at(symm_out_ptr, peer)
+            tl.store(peer_out + offs, data, mask=mask)
+
+
+def pure_allreduce_two_shot_op(ctx: GemmARContext, x: torch.Tensor) -> torch.Tensor:
+    """Two-shot pure all-reduce (reduce-scatter + all-gather) via Triton.
+
+    Moves ~2*numel bytes per rank
+    regardless of world size (vs one-shot's world_size*numel), so busbw scales
+    with world size instead of pinning to the single-link cap.
+
+    Requires the context to have been built with ``alloc_scratch=True`` so the
+    symmetric reduce-scatter scratch ``z`` is available.
+    """
+    assert ctx.symm_scratch_buf is not None, (
+        "two-shot requires create_gemm_ar_context(..., alloc_scratch=True)")
+    numel = x.numel()
+    # Lever A (barrier/phase fusion): a single fused RS+AG kernel that drops the
+    # mid barrier, the HBM scratch round-trip, and one kernel launch. It wins in
+    # the latency-bound regime (e.g. +45% at 8 MB) but loses once bandwidth-bound
+    # (crossover ~64 MB), so default it on only for payloads <= 64 MB.
+    # TD_TWO_SHOT_FUSED=1/0 forces on/off regardless of size.
+    _fused_env = os.environ.get("TD_TWO_SHOT_FUSED", "auto")
+    _nbytes = numel * x.element_size()
+    _use_fused = (ctx.num_ranks >= 4 and numel % ctx.num_ranks == 0
+                  and (_nbytes <= (64 << 20) if _fused_env == "auto" else _fused_env == "1"))
+    if _use_fused:
+        return pure_allreduce_two_shot_fused_op(ctx, x)
+    assert numel <= ctx.symm_gemm_out_buf.numel(), (
+        f"symm_gemm_out_buf too small ({ctx.symm_gemm_out_buf.numel()} elems) "
+        f"for payload ({numel} elems).")
+    assert numel <= ctx.symm_scratch_buf.numel(), (
+        f"symm_scratch_buf too small ({ctx.symm_scratch_buf.numel()} elems) "
+        f"for payload ({numel} elems).")
+    assert numel <= ctx.dma_staging_buf.numel(), (
+        f"dma_staging_buf too small ({ctx.dma_staging_buf.numel()} elems) "
+        f"for payload ({numel} elems).")
+    assert x.dtype == ctx.symm_gemm_out_buf.dtype
+
+    symm_in = ctx.symm_gemm_out_buf.reshape(-1)[:numel]
+    symm_z = ctx.symm_scratch_buf.reshape(-1)[:numel]
+    out_buf = ctx.dma_staging_buf.reshape(-1)[:numel]
+    symm_in.copy_(x.reshape(-1))
+
+    world_size = ctx.num_ranks
+    dist_policy = os.environ.get("TD_TWO_SHOT_DIST", "block").lower()
+    if dist_policy not in ("block", "interleaved"):
+        raise ValueError(f"TD_TWO_SHOT_DIST must be block|interleaved, got {dist_policy}")
+    elems_per_block = triton.cdiv(numel, world_size)
+
+    num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+    BLOCK_SIZE = 2048
+
+    # Publish `x` to peers before the reduce-scatter reads them.
+    _barrier_all_v2(ctx)
+
+    if dist_policy == "interleaved":
+        pure_allreduce_two_shot_rs_kernel_interleaved[(num_sms, )](
+            symm_in,
+            symm_z,
+            numel,
+            BLOCK_SIZE=BLOCK_SIZE,
+            NUM_COMM_SMS=num_sms,
+            num_warps=4,
+        )
+    else:
+        pure_allreduce_two_shot_rs_kernel[(num_sms, )](
+            symm_in,
+            symm_z,
+            numel,
+            elems_per_block,
+            BLOCK_SIZE=BLOCK_SIZE,
+            NUM_COMM_SMS=num_sms,
+            num_warps=4,
+        )
+
+    # Reduced chunks must be globally visible before the all-gather.
+    _barrier_all_v2(ctx)
+
+    # All-gather direction is chosen by world size (evidence: on MI355 XGMI the
+    # write direction scales better than read-pull once >2 peers contend for the
+    # incoming links, so push-AG wins at world>=4; at world==2 a single link is
+    # symmetric and pull-AG is marginally better). Override with TD_AG_PUSH=0/1.
+    _push_env = os.environ.get("TD_AG_PUSH", "auto")
+    use_push_ag = (world_size >= 4) if _push_env == "auto" else (_push_env == "1")
+
+    if use_push_ag:
+        # Push all-gather: write owned reduced chunk into every peer's symmetric
+        # output (reuse symm_in, free after RS). Result lands in symm_in on all
+        # ranks; return it directly (no extra device copy).
+        if dist_policy == "interleaved":
+            pure_allreduce_two_shot_ag_push_kernel_interleaved[(num_sms, )](
+                symm_z,
+                symm_in,
+                numel,
+                BLOCK_SIZE=BLOCK_SIZE,
+                NUM_COMM_SMS=num_sms,
+                num_warps=4,
+            )
+        elif numel % world_size == 0:
+            pure_allreduce_two_shot_ag_push_kernel[(num_sms, )](
+                symm_z,
+                symm_in,
+                numel,
+                elems_per_block,
+                BLOCK_SIZE=BLOCK_SIZE,
+                NUM_COMM_SMS=num_sms,
+                num_warps=4,
+            )
+        else:
+            use_push_ag = False
+    if use_push_ag:
+        _barrier_all_v2(ctx)
+        return symm_in.reshape(x.shape)
+
+    if dist_policy == "interleaved":
+        pure_allreduce_two_shot_ag_kernel_interleaved[(num_sms, )](
+            symm_z,
+            out_buf,
+            numel,
+            BLOCK_SIZE=BLOCK_SIZE,
+            NUM_COMM_SMS=num_sms,
+            num_warps=4,
+        )
+    else:
+        pure_allreduce_two_shot_ag_kernel[(num_sms, world_size)](
+            symm_z,
+            out_buf,
+            numel,
+            elems_per_block,
+            BLOCK_SIZE=BLOCK_SIZE,
+            NUM_COMM_SMS=num_sms,
+            num_warps=4,
+        )
+    # Ensure all peers finished reading `z` before it is reused next call.
+    _barrier_all_v2(ctx)
+    return out_buf.reshape(x.shape)
+
+
+def pure_allreduce_two_shot_fused_op(ctx: GemmARContext, x: torch.Tensor) -> torch.Tensor:
+    """Barrier-fused two-shot all-reduce (Lever A): one kernel, two barriers.
+
+    Reads the (published) symmetric input and writes the reduced-and-gathered
+    result into the *separate* symmetric scratch buffer, so the RS<->AG mid
+    barrier and the HBM scratch round-trip of the split two-shot are both
+    removed. Same XGMI traffic as the split two-shot, but 2 barriers + 1 kernel
+    instead of 3 barriers + 2 kernels. Assumes the push regime (world>=4,
+    numel divisible by world_size) and ``alloc_scratch=True``.
+    """
+    assert ctx.symm_scratch_buf is not None, (
+        "two-shot fused requires create_gemm_ar_context(..., alloc_scratch=True)")
+    numel = x.numel()
+    world_size = ctx.num_ranks
+    assert numel % world_size == 0, "two-shot fused requires numel divisible by world_size"
+    assert numel <= ctx.symm_gemm_out_buf.numel()
+    assert numel <= ctx.symm_scratch_buf.numel()
+    assert x.dtype == ctx.symm_gemm_out_buf.dtype
+
+    symm_in = ctx.symm_gemm_out_buf.reshape(-1)[:numel]
+    symm_z = ctx.symm_scratch_buf.reshape(-1)[:numel]
+    symm_in.copy_(x.reshape(-1))
+
+    elems_per_block = triton.cdiv(numel, world_size)
+    num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+    BLOCK_SIZE = 2048
+
+    _barrier_all_v2(ctx)  # publish input to peers
+    pure_allreduce_two_shot_fused_kernel[(num_sms, )](
+        symm_in,
+        symm_z,
+        numel,
+        elems_per_block,
+        BLOCK_SIZE=BLOCK_SIZE,
+        NUM_COMM_SMS=num_sms,
+        num_warps=4,
+    )
+    _barrier_all_v2(ctx)  # all peer pushes landed before `z` is read/reused
+    return symm_z.reshape(x.shape)
+
+
+def pure_allreduce_two_shot_push_op(ctx: GemmARContext, x: torch.Tensor) -> torch.Tensor:
+    """Fully push-based two-shot all-reduce (direct peer stores, no rocSHMEM put).
+
+    Both phases move cross-fabric data in the XGMI *write* direction, which
+    saturates the fabric better than dependent remote loads at large world size:
+
+      1. RS-push:   rank r writes its chunk-b slice into owner b's recv slot r.
+      2. local reduce: owner b sums its W recv slots -> reduced chunk b (HBM).
+      3. AG-push:   rank r writes reduced chunk r into every peer's output.
+
+    Requires ``alloc_scratch=True`` and ``numel % world_size == 0``.
+    """
+    assert ctx.symm_scratch_buf is not None, (
+        "two-shot push requires create_gemm_ar_context(..., alloc_scratch=True)")
+    numel = x.numel()
+    world_size = ctx.num_ranks
+    assert numel % world_size == 0, "two-shot push requires numel divisible by world_size"
+    assert numel <= ctx.symm_gemm_out_buf.numel()
+    assert numel <= ctx.symm_scratch_buf.numel()
+    assert x.dtype == ctx.symm_gemm_out_buf.dtype
+
+    symm_in = ctx.symm_gemm_out_buf.reshape(-1)[:numel]  # input, then reduced chunks
+    symm_recv = ctx.symm_scratch_buf.reshape(-1)[:numel]  # recv slots, then AG output
+    symm_in.copy_(x.reshape(-1))
+
+    elems_per_block = numel // world_size
+    num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+    BLOCK_SIZE = 2048
+
+    _barrier_all_v2(ctx)  # publish input
+    pure_allreduce_two_shot_rs_push_kernel[(num_sms, world_size)](
+        symm_in, symm_recv, numel, elems_per_block,
+        BLOCK_SIZE=BLOCK_SIZE, NUM_COMM_SMS=num_sms, num_warps=4)
+    _barrier_all_v2(ctx)  # all recv slots delivered
+    pure_allreduce_two_shot_local_reduce_kernel[(num_sms, )](
+        symm_recv, symm_in, numel, elems_per_block,
+        BLOCK_SIZE=BLOCK_SIZE, NUM_COMM_SMS=num_sms, num_warps=4)
+    _barrier_all_v2(ctx)  # reduced chunks ready; recv free to reuse as AG output
+    pure_allreduce_two_shot_ag_push_kernel[(num_sms, )](
+        symm_in, symm_recv, numel, elems_per_block,
+        BLOCK_SIZE=BLOCK_SIZE, NUM_COMM_SMS=num_sms, num_warps=4)
+    _barrier_all_v2(ctx)  # all gathers landed
+    return symm_recv.reshape(x.shape)

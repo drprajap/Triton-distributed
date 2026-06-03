@@ -54,7 +54,9 @@ DTYPES = {
     "float32": torch.float32,
 }
 
-TRANSPORTS = ("torch", "triton_dma", "triton_one_shot")
+TRANSPORTS = ("torch", "triton_dma", "triton_one_shot", "triton_two_shot", "triton_two_shot_push")
+# Transports that go through triton_dist (need rocshmem init + a GemmARContext).
+TRITON_TRANSPORTS = ("triton_dma", "triton_one_shot", "triton_two_shot", "triton_two_shot_push")
 
 
 def human_bytes(n: int) -> str:
@@ -113,7 +115,7 @@ def main():
     ap.add_argument("--output", type=str, default="")
     args = ap.parse_args()
 
-    if args.transport in ("triton_dma", "triton_one_shot"):
+    if args.transport in TRITON_TRANSPORTS:
         # triton_dist.initialize_distributed handles both torch.dist and
         # rocshmem init in the correct order for AMD.
         from triton_dist.utils import initialize_distributed, finalize_distributed  # noqa: F401
@@ -138,29 +140,38 @@ def main():
     # Transport setup.
     ctx = None
     ar_op = None
-    if args.transport in ("triton_dma", "triton_one_shot"):
+    if args.transport in TRITON_TRANSPORTS:
         # Lazy import so --transport torch does not require triton_dist build.
         from triton_dist.kernels.amd.gemm_allreduce import (
             create_gemm_ar_context,
             pure_allreduce_dma_op,
             pure_allreduce_one_shot_op,
+            pure_allreduce_two_shot_op,
+            pure_allreduce_two_shot_push_op,
         )
         N = args.ctx_N
         max_bytes = max(sizes)
         max_numel = max_bytes // elem
         # Round up max_M so max_M * N >= max_numel.
         max_M = (max_numel + N - 1) // N
+        # Two-shot needs a second symmetric buffer (reduce-scatter scratch).
+        alloc_scratch = args.transport in ("triton_two_shot", "triton_two_shot_push")
         if rank == 0:
+            mult = 2 if alloc_scratch else 1
             print(f"# {args.transport} context: max_M={max_M}  N={N}  "
-                  f"symm_bytes≈{max_M * N * elem / (1<<20):.1f} MB / rank",
+                  f"symm_bytes≈{mult * max_M * N * elem / (1<<20):.1f} MB / rank",
                   flush=True)
         ar_stream = torch.cuda.Stream()
         ctx = create_gemm_ar_context(ar_stream, rank, world, max_M=max_M, N=N,
-                                     dtype=dtype)
+                                     dtype=dtype, alloc_scratch=alloc_scratch)
         if args.transport == "triton_dma":
             ar_op = pure_allreduce_dma_op
-        else:
+        elif args.transport == "triton_one_shot":
             ar_op = pure_allreduce_one_shot_op
+        elif args.transport == "triton_two_shot_push":
+            ar_op = pure_allreduce_two_shot_push_op
+        else:
+            ar_op = pure_allreduce_two_shot_op
 
     if rank == 0:
         print(f"# Pure all_reduce bandwidth sweep  (transport={args.transport})",
@@ -176,7 +187,7 @@ def main():
     rows = []
     # Correctness sanity check for triton transports: run once on a 16KB payload
     # with per-rank-distinct values and compare against torch.distributed.
-    if args.transport in ("triton_dma", "triton_one_shot"):
+    if args.transport in TRITON_TRANSPORTS:
         vsize = 8192
         v = torch.full((vsize, ), float(rank + 1), dtype=dtype, device="cuda")
         ref = v.clone()
@@ -217,7 +228,7 @@ def main():
         try:
             if args.transport == "torch":
                 ms = bench_one_torch(t, args.iters, args.warmup)
-            elif args.transport in ("triton_dma", "triton_one_shot"):
+            elif args.transport in TRITON_TRANSPORTS:
                 ms = bench_one_triton_dma(ctx, t, ar_op, args.iters, args.warmup)
             else:
                 raise ValueError(f"unknown transport {args.transport}")
@@ -265,7 +276,7 @@ def main():
     # rocSHMEM teardown can segfault on some stacks after we've released
     # tensor lists. All measurement data is already persisted at this point,
     # so force-exit cleanly to avoid masking real failures with dealloc noise.
-    if args.transport in ("triton_dma", "triton_one_shot"):
+    if args.transport in TRITON_TRANSPORTS:
         torch.cuda.synchronize()
         os._exit(0)
     dist.destroy_process_group()

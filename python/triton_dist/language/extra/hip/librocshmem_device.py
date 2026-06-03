@@ -436,7 +436,7 @@ def fence(_semantic=None):
         "",
         [],
         {
-            (): ("rocshmem_fence_wrapper", ()),
+            (): ("rocshmem_fence_wave_wrapper", ()),
         },
         is_pure=False,
         _semantic=_semantic,

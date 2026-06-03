@@ -34,6 +34,7 @@ from triton_dist.kernels.amd.gemm_allreduce import (
     create_gemm_ar_context,
     gemm_allreduce_op,
     gemm_allreduce_op_dma,
+    gemm_allreduce_op_two_shot,
 )
 from triton_dist.profiler_utils import group_profile, perf_func
 from triton_dist.test.utils import assert_allclose
@@ -98,6 +99,8 @@ def _run_triton_op(mode: str, ctx, A, B, autotune: bool = True):
         return gemm_allreduce_op(ctx, A, B, autotune=autotune)
     if mode == "dma":
         return gemm_allreduce_op_dma(ctx, A, B, autotune=autotune)
+    if mode == "two_shot":
+        return gemm_allreduce_op_two_shot(ctx, A, B, autotune=autotune)
     raise ValueError(f"Unknown AR mode: {mode}")
 
 
@@ -224,7 +227,7 @@ def run_benchmark_matrix(args, TP_GROUP):
 
         ar_stream = torch.cuda.Stream(priority=-1)
         ctx = create_gemm_ar_context(ar_stream=ar_stream, rank=RANK, world_size=WORLD_SIZE,
-                                     max_M=max_M, N=max_N, dtype=dtype)
+                                     max_M=max_M, N=max_N, dtype=dtype, alloc_scratch=True)
         try:
             for (M, N) in shapes:
                 A, B = _make_data(M, N, K_per_rank, dtype, TP_GROUP)
@@ -315,8 +318,9 @@ def parse_args():
     parser.add_argument("N", type=int, nargs="?", default=8192)
     parser.add_argument("K", type=int, nargs="?", default=4096)
     parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16"])
-    parser.add_argument("--ar_mode", default="cu", choices=["cu", "dma"],
-                        help="Single-run mode: AR transport (cu=Triton consumer kernel, dma=hipMemcpy NoCU)")
+    parser.add_argument("--ar_mode", default="cu", choices=["cu", "dma", "two_shot"],
+                        help="Single-run mode: AR transport (cu=overlapped consumer kernel, "
+                        "dma=hipMemcpy NoCU, two_shot=full-occupancy GEMM + two-shot push-AG AR)")
     parser.add_argument("--no_autotune", action="store_true",
                         help="Disable Triton autotune for single-run mode (default: autotune on)")
     parser.add_argument("--warmup", default=10, type=int, help="warmup iterations")
@@ -332,8 +336,8 @@ def parse_args():
     parser.add_argument("--bench_K", type=int, default=4096, help="Global K used for the matrix sweep")
     parser.add_argument("--bench_dtypes", nargs="*", default=None, choices=["float16", "bfloat16"],
                         help="Subset of dtypes to sweep (default: both)")
-    parser.add_argument("--bench_ar_modes", nargs="*", default=None, choices=["cu", "dma"],
-                        help="Subset of AR modes to sweep (default: both)")
+    parser.add_argument("--bench_ar_modes", nargs="*", default=None, choices=["cu", "dma", "two_shot"],
+                        help="Subset of AR modes to sweep (default: cu+dma)")
     parser.add_argument("--output", type=str, default=None,
                         help="Path to a Markdown file to append matrix rows to (rank 0 only)")
     parser.add_argument("--no_bench_autotune", action="store_true",
@@ -376,7 +380,8 @@ if __name__ == "__main__":
 
     # Create context for GEMM+AllReduce
     ar_stream = torch.cuda.Stream(priority=-1)
-    ctx = create_gemm_ar_context(ar_stream=ar_stream, rank=RANK, world_size=WORLD_SIZE, max_M=M, N=N, dtype=dtype)
+    ctx = create_gemm_ar_context(ar_stream=ar_stream, rank=RANK, world_size=WORLD_SIZE, max_M=M, N=N, dtype=dtype,
+                                 alloc_scratch=True)
     autotune_on_single = not args.no_autotune
     a, b = _make_data(M, N, K, dtype, TP_GROUP)
     torch_output = gemm_allreduce_torch(a, b, TP_GROUP)

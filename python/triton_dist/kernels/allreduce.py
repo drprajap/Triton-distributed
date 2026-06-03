@@ -54,6 +54,11 @@ _ALLREDUCE_METHODS = {
     "one_shot": AllReduceMethod.OneShot,
     "two_shot": AllReduceMethod.TwoShot,
     "one_shot_tma": AllReduceMethod.OneShot_TMA,
+    "one_shot_pull": AllReduceMethod.OneShot_TMA,  # AMD: pull-based one-shot (FIX3)
+    # AMD: single-pass ring AR ((W-1) hops on the symm ring buffer).
+    # Reuses the otherwise-unused DoubleTree enum slot since DoubleTree is
+    # NVIDIA-only.
+    "ring": AllReduceMethod.DoubleTree,
     "one_shot_multimem": AllReduceMethod.OneShot_Multimem,  # requires nbytes symmetric buffer
     "two_shot_multimem": AllReduceMethod.TwoShot_Multimem,  # requires
     # deprecated: TwoShot_Multimem_ST use multimem but not fully use multimem instructions.

@@ -86,3 +86,7 @@ tmp*
 
 .cursor
 *.csv
+
+# AR debugging artifacts (ISA dumps, torch.profiler traces)
+isa_dumps/
+profiles/
